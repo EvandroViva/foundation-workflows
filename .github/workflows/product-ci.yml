@@ -1,0 +1,156 @@
+name: Product CI (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      package-scope:
+        description: 'pnpm workspace scope of the calling product (e.g. @betting-pool)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # ── Detect Changes ────────────────────────────────────────
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      api: ${{ steps.filter.outputs.api }}
+      workers: ${{ steps.filter.outputs.workers }}
+      mobile: ${{ steps.filter.outputs.mobile }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            api:
+              - 'apps/api/**'
+              - 'packages/shared-types/**'
+            workers:
+              - 'apps/workers/**'
+              - 'packages/shared-types/**'
+            mobile:
+              - 'apps/mobile/**'
+              - 'packages/shared-types/**'
+              - 'packages/theme-tokens/**'
+
+  # ── Format Check ──────────────────────────────────────────
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EvandroViva/foundation-workflows/.github/actions/setup-node-pnpm@main
+        with:
+          node-auth-token: ${{ secrets.GHCR_PAT }}
+
+      - name: Check formatting
+        run: pnpm format:check
+
+  # ── Lint ──────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EvandroViva/foundation-workflows/.github/actions/setup-node-pnpm@main
+        with:
+          node-auth-token: ${{ secrets.GHCR_PAT }}
+
+      - name: Build shared packages
+        run: pnpm --filter ${{ inputs.package-scope }}/shared-types build
+
+      - name: Generate Prisma client
+        run: pnpm --filter ${{ inputs.package-scope }}/api exec prisma generate
+
+      - name: Lint
+        run: pnpm lint
+
+  # ── API Tests ─────────────────────────────────────────────
+  test-api:
+    name: Test API
+    needs: [changes]
+    if: ${{ needs.changes.outputs.api == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EvandroViva/foundation-workflows/.github/actions/setup-node-pnpm@main
+        with:
+          node-auth-token: ${{ secrets.GHCR_PAT }}
+
+      - name: Build shared packages
+        run: pnpm --filter ${{ inputs.package-scope }}/shared-types build
+
+      - name: Generate Prisma client
+        run: pnpm --filter ${{ inputs.package-scope }}/api exec prisma generate
+
+      - name: Run API tests
+        run: pnpm --filter ${{ inputs.package-scope }}/api test
+
+  # ── Workers Tests ─────────────────────────────────────────
+  test-workers:
+    name: Test Workers
+    needs: [changes]
+    if: ${{ needs.changes.outputs.workers == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EvandroViva/foundation-workflows/.github/actions/setup-node-pnpm@main
+        with:
+          node-auth-token: ${{ secrets.GHCR_PAT }}
+
+      - name: Build shared packages
+        run: pnpm --filter ${{ inputs.package-scope }}/shared-types build
+
+      - name: Run Workers tests
+        run: pnpm --filter ${{ inputs.package-scope }}/workers test
+
+  # ── Mobile Tests (Snapshots) ──────────────────────────────
+  test-mobile:
+    name: Test Mobile
+    needs: [changes]
+    if: ${{ needs.changes.outputs.mobile == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EvandroViva/foundation-workflows/.github/actions/setup-node-pnpm@main
+        with:
+          node-auth-token: ${{ secrets.GHCR_PAT }}
+
+      - name: Build shared packages
+        run: pnpm --filter ${{ inputs.package-scope }}/shared-types --filter ${{ inputs.package-scope }}/theme-tokens build
+
+      - name: Run Mobile tests
+        run: pnpm --filter ${{ inputs.package-scope }}/mobile test
+
+  # ── Build ─────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [format, lint, test-api, test-workers, test-mobile]
+    if: >-
+      always() &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EvandroViva/foundation-workflows/.github/actions/setup-node-pnpm@main
+        with:
+          node-auth-token: ${{ secrets.GHCR_PAT }}
+
+      - name: Generate Prisma client
+        run: pnpm --filter ${{ inputs.package-scope }}/api exec prisma generate
+
+      - name: Build all
+        run: pnpm build

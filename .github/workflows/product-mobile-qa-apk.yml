@@ -1,0 +1,251 @@
+name: Product Mobile QA APK (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      package-scope:
+        description: 'pnpm workspace scope of the calling product (e.g. @betting-pool)'
+        required: true
+        type: string
+      app-name:
+        description: 'Product name used to prefix the built APK filename (e.g. chutai)'
+        required: true
+        type: string
+      development-api-url:
+        required: true
+        type: string
+      development-web-url:
+        required: true
+        type: string
+      development-app-scheme:
+        required: true
+        type: string
+      sandbox-api-url:
+        required: true
+        type: string
+      sandbox-web-url:
+        required: true
+        type: string
+      sandbox-app-scheme:
+        required: true
+        type: string
+      production-api-url:
+        required: true
+        type: string
+      production-web-url:
+        required: true
+        type: string
+      production-app-scheme:
+        required: true
+        type: string
+      environment:
+        description: 'Target environment'
+        required: true
+        type: string
+      skip_tests:
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: mobile-qa-apk-${{ inputs.app-name }}-${{ inputs.environment }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  # ── Lint & Test ───────────────────────────────────────────
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    if: inputs.skip_tests == false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EvandroViva/foundation-workflows/.github/actions/setup-node-pnpm@main
+        with:
+          node-auth-token: ${{ secrets.GHCR_PAT }}
+
+      - name: Build shared packages
+        run: pnpm --filter ${{ inputs.package-scope }}/shared-types build
+
+      - name: Generate Prisma client
+        run: pnpm --filter ${{ inputs.package-scope }}/api exec prisma generate
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Test
+        run: pnpm test
+
+  # ── Build Android APK ────────────────────────────────────
+  build-apk:
+    name: Build APK (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: always() && (needs.lint-and-test.result == 'success' || needs.lint-and-test.result == 'skipped')
+    permissions:
+      contents: read
+    steps:
+      - name: Validate required secrets
+        env:
+          GSERVICES_DEV: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64_DEV }}
+          GSERVICES_SANDBOX: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64_SANDBOX }}
+          GSERVICES_PROD: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          case "${{ inputs.environment }}" in
+            development)
+              [ -n "$GSERVICES_DEV" ] || { echo "::error::Secret GOOGLE_SERVICES_JSON_BASE64_DEV is not set. Add it in Settings → Secrets → Actions."; exit 1; }
+              ;;
+            sandbox)
+              [ -n "$GSERVICES_SANDBOX" ] || { echo "::error::Secret GOOGLE_SERVICES_JSON_BASE64_SANDBOX is not set."; exit 1; }
+              ;;
+            production)
+              [ -n "$GSERVICES_PROD" ] || { echo "::error::Secret GOOGLE_SERVICES_JSON_BASE64 is not set."; exit 1; }
+              ;;
+          esac
+          [ -n "$KEYSTORE" ] || { echo "::error::Secret ANDROID_KEYSTORE_BASE64 is not set."; exit 1; }
+
+      - uses: actions/checkout@v4
+
+      - uses: EvandroViva/foundation-workflows/.github/actions/setup-node-pnpm@main
+        with:
+          node-auth-token: ${{ secrets.GHCR_PAT }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Build shared packages
+        run: |
+          pnpm --filter ${{ inputs.package-scope }}/shared-types build
+          pnpm --filter ${{ inputs.package-scope }}/theme-tokens build
+
+      - name: Decode google-services.json
+        run: |
+          case "${{ inputs.environment }}" in
+            development)
+              printf '%s' "${{ secrets.GOOGLE_SERVICES_JSON_BASE64_DEV }}" | base64 -d > apps/mobile/google-services.dev.json
+              GSERVICES_FILE="apps/mobile/google-services.dev.json"
+              ;;
+            sandbox)
+              printf '%s' "${{ secrets.GOOGLE_SERVICES_JSON_BASE64_SANDBOX }}" | base64 -d > apps/mobile/google-services.sandbox.json
+              GSERVICES_FILE="apps/mobile/google-services.sandbox.json"
+              ;;
+            production)
+              printf '%s' "${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}" | base64 -d > apps/mobile/google-services.json
+              GSERVICES_FILE="apps/mobile/google-services.json"
+              ;;
+          esac
+          echo "::group::Validate $GSERVICES_FILE"
+          python3 -c "import json; json.load(open('$GSERVICES_FILE')); print('Valid JSON ✓')"
+          echo "::endgroup::"
+
+      - name: Write environment file
+        working-directory: apps/mobile
+        run: |
+          case "${{ inputs.environment }}" in
+            development)
+              printf '%s\n' \
+                "APP_ENV=development" \
+                "EXPO_PUBLIC_API_URL=${{ inputs.development-api-url }}" \
+                "EXPO_PUBLIC_APP_SCHEME=${{ inputs.development-app-scheme }}" \
+                "EXPO_PUBLIC_WEB_URL=${{ inputs.development-web-url }}" \
+                "EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID=${{ secrets.GOOGLE_WEB_CLIENT_ID }}" \
+                > .env.development
+              echo "ENV_FILE=.env.development" >> "$GITHUB_ENV"
+              ;;
+            sandbox)
+              printf '%s\n' \
+                "APP_ENV=sandbox" \
+                "EXPO_PUBLIC_API_URL=${{ inputs.sandbox-api-url }}" \
+                "EXPO_PUBLIC_APP_SCHEME=${{ inputs.sandbox-app-scheme }}" \
+                "EXPO_PUBLIC_WEB_URL=${{ inputs.sandbox-web-url }}" \
+                "EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID=${{ secrets.GOOGLE_WEB_CLIENT_ID }}" \
+                > .env.sandbox
+              echo "ENV_FILE=.env.sandbox" >> "$GITHUB_ENV"
+              ;;
+            production)
+              printf '%s\n' \
+                "APP_ENV=production" \
+                "EXPO_PUBLIC_API_URL=${{ inputs.production-api-url }}" \
+                "EXPO_PUBLIC_APP_SCHEME=${{ inputs.production-app-scheme }}" \
+                "EXPO_PUBLIC_WEB_URL=${{ inputs.production-web-url }}" \
+                "EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID=${{ secrets.GOOGLE_WEB_CLIENT_ID }}" \
+                > .env.production
+              echo "ENV_FILE=.env.production" >> "$GITHUB_ENV"
+              ;;
+          esac
+
+      - name: Expo prebuild
+        working-directory: apps/mobile
+        run: npx dotenv-cli -e ${{ env.ENV_FILE }} -- npx expo prebuild --platform android --no-install
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Decode keystore
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > apps/mobile/android/app/upload-keystore.jks
+
+      - name: Configure release signing
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+          VERSION_NAME: ''
+        run: node scripts/patch-android-signing.js
+
+      - name: Build APK
+        working-directory: apps/mobile
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: npx dotenv-cli -e ${{ env.ENV_FILE }} -- bash -c 'cd android && ./gradlew assembleRelease'
+
+      - name: Rename APK
+        run: |
+          ENV="${{ inputs.environment }}"
+          APP_NAME="${{ inputs.app-name }}"
+          SHA="${{ github.sha }}"
+          SHORT_SHA="${SHA:0:7}"
+          mv apps/mobile/android/app/build/outputs/apk/release/app-release.apk \
+             apps/mobile/android/app/build/outputs/apk/release/${APP_NAME}-${ENV}-${SHORT_SHA}.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.environment }}-${{ github.run_number }}
+          path: apps/mobile/android/app/build/outputs/apk/release/*.apk
+          retention-days: 14
+
+      - name: Write job summary
+        uses: actions/github-script@v7
+        env:
+          BUILD_ENV: ${{ inputs.environment }}
+          SHORT_SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+          SKIP_TESTS: ${{ inputs.skip_tests }}
+        with:
+          script: |
+            const env = process.env.BUILD_ENV;
+            const sha = process.env.SHORT_SHA.substring(0, 7);
+            const run = process.env.RUN_NUMBER;
+            const skippedTests = process.env.SKIP_TESTS === 'true';
+
+            const summary = `## QA APK Build
+
+            | | |
+            |---|---|
+            | **Environment** | \`${env}\` |
+            | **Commit** | \`${sha}\` |
+            | **Build #** | \`${run}\` |
+            | **Tests** | ${skippedTests ? '⏭️ Skipped' : '✅ Passed'} |
+
+            ### Download
+            The APK is available as an artifact: **\`apk-${env}-${run}\`**
+
+            > Artifact expires in **14 days**. Install directly on Android devices (enable "Install unknown apps" in settings).
+            `;
+
+            await core.summary.addRaw(summary).write();

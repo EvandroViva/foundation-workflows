@@ -1,0 +1,291 @@
+name: Product Mobile Deploy (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      package-scope:
+        description: 'pnpm workspace scope of the calling product (e.g. @betting-pool)'
+        required: true
+        type: string
+      android-package-production:
+        description: 'Android application ID for production (e.g. com.chutai.app)'
+        required: true
+        type: string
+      android-package-sandbox:
+        description: 'Android application ID for sandbox (e.g. com.chutai.sandbox.app)'
+        required: true
+        type: string
+      production-api-url:
+        required: true
+        type: string
+      production-web-url:
+        required: true
+        type: string
+      production-app-scheme:
+        required: true
+        type: string
+      sandbox-api-url:
+        required: true
+        type: string
+      sandbox-web-url:
+        required: true
+        type: string
+      sandbox-app-scheme:
+        required: true
+        type: string
+      environment:
+        description: 'Target environment'
+        required: true
+        type: string
+      deploy_android:
+        required: false
+        type: boolean
+        default: true
+      deploy_ios:
+        required: false
+        type: boolean
+        default: true
+      track:
+        description: 'Google Play track (Android only)'
+        required: true
+        type: string
+      version_name:
+        required: false
+        type: string
+      version_code:
+        required: false
+        type: string
+
+concurrency:
+  group: mobile-deploy-${{ inputs.android-package-production }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  # ── Lint & Test ───────────────────────────────────────────
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EvandroViva/foundation-workflows/.github/actions/setup-node-pnpm@main
+        with:
+          node-auth-token: ${{ secrets.GHCR_PAT }}
+
+      - name: Build shared packages
+        run: pnpm --filter ${{ inputs.package-scope }}/shared-types build
+
+      - name: Generate Prisma client
+        run: pnpm --filter ${{ inputs.package-scope }}/api exec prisma generate
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Test
+        run: pnpm test
+
+  # ── Build Android AAB ────────────────────────────────────
+  build-android:
+    name: Build Android
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: inputs.deploy_android == true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EvandroViva/foundation-workflows/.github/actions/setup-node-pnpm@main
+        with:
+          node-auth-token: ${{ secrets.GHCR_PAT }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Build shared packages
+        run: |
+          pnpm --filter ${{ inputs.package-scope }}/shared-types build
+          pnpm --filter ${{ inputs.package-scope }}/theme-tokens build
+
+      - name: Decode google-services.json
+        run: |
+          if [ "${{ inputs.environment }}" = "sandbox" ]; then
+            printf '%s' "${{ secrets.GOOGLE_SERVICES_JSON_BASE64_SANDBOX }}" | base64 -d > apps/mobile/google-services.sandbox.json
+          else
+            printf '%s' "${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}" | base64 -d > apps/mobile/google-services.json
+          fi
+          GSERVICES_FILE=$(ls apps/mobile/google-services*.json | head -1)
+          echo "::group::Validate $GSERVICES_FILE"
+          python3 -c "import json; json.load(open('$GSERVICES_FILE')); print('Valid JSON ✓')"
+          echo "::endgroup::"
+
+      - name: Write environment file
+        working-directory: apps/mobile
+        run: |
+          if [ "${{ inputs.environment }}" = "sandbox" ]; then
+            printf '%s\n' \
+              "APP_ENV=sandbox" \
+              "EXPO_PUBLIC_API_URL=${{ inputs.sandbox-api-url }}" \
+              "EXPO_PUBLIC_APP_SCHEME=${{ inputs.sandbox-app-scheme }}" \
+              "EXPO_PUBLIC_WEB_URL=${{ inputs.sandbox-web-url }}" \
+              "EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID=${{ secrets.GOOGLE_WEB_CLIENT_ID }}" \
+              > .env.sandbox
+            echo "ENV_FILE=.env.sandbox" >> "$GITHUB_ENV"
+          else
+            printf '%s\n' \
+              "APP_ENV=production" \
+              "EXPO_PUBLIC_API_URL=${{ inputs.production-api-url }}" \
+              "EXPO_PUBLIC_APP_SCHEME=${{ inputs.production-app-scheme }}" \
+              "EXPO_PUBLIC_WEB_URL=${{ inputs.production-web-url }}" \
+              "EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID=${{ secrets.GOOGLE_WEB_CLIENT_ID }}" \
+              > .env.production
+            echo "ENV_FILE=.env.production" >> "$GITHUB_ENV"
+          fi
+
+      - name: Expo prebuild
+        working-directory: apps/mobile
+        run: npx dotenv-cli -e ${{ env.ENV_FILE }} -- npx expo prebuild --platform android --no-install
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Decode keystore
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > apps/mobile/android/app/upload-keystore.jks
+
+      - name: Resolve version code
+        id: version
+        run: |
+          if [ -n "${{ inputs.version_code }}" ]; then
+            echo "code=${{ inputs.version_code }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure release signing
+        env:
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+          VERSION_NAME: ${{ inputs.version_name }}
+        run: node scripts/patch-android-signing.js
+
+      - name: Build AAB
+        working-directory: apps/mobile
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: npx dotenv-cli -e ${{ env.ENV_FILE }} -- bash -c 'cd android && ./gradlew bundleRelease'
+
+      - name: Upload AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: apps/mobile/android/app/build/outputs/bundle/release/*.aab
+          retention-days: 30
+
+  # ── Deploy to Google Play ────────────────────────────────
+  deploy-play-store:
+    name: Deploy to Google Play
+    runs-on: ubuntu-latest
+    needs: build-android
+    if: inputs.deploy_android == true
+    permissions: {}
+    environment: google-play
+    steps:
+      - name: Download AAB
+        uses: actions/download-artifact@v4
+        with:
+          name: app-release
+
+      - name: Upload to Google Play
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: ${{ inputs.environment == 'sandbox' && inputs.android-package-sandbox || inputs.android-package-production }}
+          releaseFiles: '*.aab'
+          track: ${{ inputs.track }}
+          status: draft
+
+  # ── Deploy iOS (push to deploy branch) ───────────────────
+  deploy-ios:
+    name: Deploy iOS
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: inputs.deploy_ios == true
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve deploy branch
+        id: branch
+        run: |
+          if [[ "${{ inputs.environment }}" == "production" ]]; then
+            echo "name=deploy" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=deploy-sandbox" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push to deploy branch
+        run: |
+          BRANCH="${{ steps.branch.outputs.name }}"
+          echo "Pushing ${{ github.sha }} to $BRANCH"
+          git push origin "${{ github.sha }}:refs/heads/$BRANCH" --force
+
+  # ── Summary ──────────────────────────────────────────────
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    needs: [deploy-play-store, deploy-ios]
+    if: always()
+    permissions: {}
+    steps:
+      - name: Write job summary
+        uses: actions/github-script@v7
+        env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          SHORT_SHA: ${{ github.sha }}
+          DEPLOY_ANDROID: ${{ inputs.deploy_android }}
+          DEPLOY_IOS: ${{ inputs.deploy_ios }}
+          TRACK: ${{ inputs.track }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          VERSION_CODE: ${{ inputs.version_code }}
+          ANDROID_BUILD_RESULT: ${{ needs.deploy-play-store.result }}
+          IOS_RESULT: ${{ needs.deploy-ios.result }}
+        with:
+          script: |
+            const env = process.env.DEPLOY_ENV;
+            const sha = process.env.SHORT_SHA.substring(0, 7);
+            const deployAndroid = process.env.DEPLOY_ANDROID;
+            const deployIos = process.env.DEPLOY_IOS;
+            const track = process.env.TRACK;
+            const versionName = process.env.VERSION_NAME || '(default)';
+            const versionCode = process.env.VERSION_CODE || '(auto)';
+            const androidResult = process.env.ANDROID_BUILD_RESULT;
+            const iosResult = process.env.IOS_RESULT;
+            const iosBranch = env === 'production' ? 'deploy' : 'deploy-sandbox';
+
+            const icon = (v) => v === 'true' ? '✅' : '⬜';
+            const statusIcon = (r) => r === 'success' ? '✅' : r === 'skipped' ? '⏭️' : '❌';
+
+            const summary = `## Mobile Deploy Summary
+
+            | | |
+            |---|---|
+            | **Environment** | \`${env}\` |
+            | **Commit** | \`${sha}\` |
+
+            ### Platforms
+
+            | Platform | Selected | Details | Result |
+            |----------|----------|---------|--------|
+            | Android | ${icon(deployAndroid)} | Track: \`${track}\`, Version: \`${versionName}\` (code: \`${versionCode}\`) | ${statusIcon(androidResult)} ${androidResult} |
+            | iOS | ${icon(deployIos)} | Branch: \`${iosBranch}\` | ${statusIcon(iosResult)} ${iosResult} |
+            `;
+
+            await core.summary.addRaw(summary).write();

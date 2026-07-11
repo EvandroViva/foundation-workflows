@@ -1,0 +1,367 @@
+name: Product Deploy Services (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      package-scope:
+        description: 'pnpm workspace scope of the calling product (e.g. @betting-pool)'
+        required: true
+        type: string
+      image-name:
+        description: 'GHCR image name / EC2 project directory name (e.g. chutai)'
+        required: true
+        type: string
+      container-prefix:
+        description: 'Base name of the API container (e.g. bp-api); "-sandbox" is appended for the sandbox environment'
+        required: true
+        type: string
+      enable-datadog:
+        description: 'Whether the host runs a Datadog agent container to keep up during production deploys'
+        required: false
+        type: boolean
+        default: false
+      environment:
+        description: 'Target environment'
+        required: true
+        type: string
+      deploy_api:
+        required: false
+        type: boolean
+        default: true
+      deploy_web:
+        required: false
+        type: boolean
+        default: true
+      deploy_admin:
+        required: false
+        type: boolean
+        default: true
+      deploy_workers:
+        required: false
+        type: boolean
+        default: true
+      backup:
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-${{ inputs.image-name }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  # ── Lint & Test ───────────────────────────────────────────
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EvandroViva/foundation-workflows/.github/actions/setup-node-pnpm@main
+        with:
+          node-auth-token: ${{ secrets.GHCR_PAT }}
+
+      - name: Build shared packages
+        run: pnpm --filter ${{ inputs.package-scope }}/shared-types build
+
+      - name: Generate Prisma client
+        run: pnpm --filter ${{ inputs.package-scope }}/api exec prisma generate
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Test
+        run: pnpm test
+
+  # ── Prepare Build Matrix ──────────────────────────────────
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.matrix.outputs.services }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_prefix: ${{ steps.meta.outputs.image_prefix }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+    steps:
+      - name: Build service matrix
+        id: matrix
+        run: |
+          SERVICES="[]"
+          if [[ "${{ inputs.deploy_api }}" == "true" ]]; then
+            SERVICES=$(echo "$SERVICES" | jq -c '. + ["api"]')
+          fi
+          if [[ "${{ inputs.deploy_workers }}" == "true" ]]; then
+            SERVICES=$(echo "$SERVICES" | jq -c '. + ["workers"]')
+          fi
+          if [[ "${{ inputs.deploy_web }}" == "true" ]]; then
+            SERVICES=$(echo "$SERVICES" | jq -c '. + ["web"]')
+          fi
+          if [[ "${{ inputs.deploy_admin }}" == "true" ]]; then
+            SERVICES=$(echo "$SERVICES" | jq -c '. + ["admin"]')
+          fi
+          echo "services=$SERVICES" >> "$GITHUB_OUTPUT"
+          echo "Selected services: $SERVICES"
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IMAGE_TAG="${{ inputs.environment }}-${SHORT_SHA}"
+          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          IMAGE_PREFIX="ghcr.io/${OWNER}/${{ inputs.image-name }}"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "image_prefix=$IMAGE_PREFIX" >> "$GITHUB_OUTPUT"
+
+  # ── Build & Push Docker Images ────────────────────────────
+  build-and-push:
+    name: Build ${{ matrix.service }}
+    runs-on: ubuntu-24.04-arm
+    needs: [lint-and-test, prepare]
+    if: needs.prepare.outputs.services != '[]'
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.prepare.outputs.services) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare build secrets
+        run: |
+          # grep -v exits 1 when no lines match; pipefail would abort the step.
+          # Write filtered output or an empty file if all content is filtered/secret is unset.
+          { printf '%s\n' "$WEB_ENV" | grep -v '^#' | grep -v '^$' || true; } > /tmp/web.env
+          { printf '%s\n' "$ADMIN_ENV" | grep -v '^#' | grep -v '^$' || true; } > /tmp/admin.env
+          # Compute hashes so the Dockerfile ARG changes whenever the env content changes,
+          # busting the Docker layer cache for the `next build` step automatically.
+          echo "WEB_ENV_HASH=$(md5sum /tmp/web.env | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          echo "ADMIN_ENV_HASH=$(md5sum /tmp/admin.env | cut -d' ' -f1)" >> "$GITHUB_ENV"
+        env:
+          WEB_ENV: ${{ secrets.WEB_ENV }}
+          ADMIN_ENV: ${{ secrets.ADMIN_ENV }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/${{ matrix.service }}/Dockerfile
+          push: true
+          tags: |
+            ${{ needs.prepare.outputs.image_prefix }}/${{ matrix.service }}:${{ needs.prepare.outputs.image_tag }}
+            ${{ needs.prepare.outputs.image_prefix }}/${{ matrix.service }}:${{ inputs.environment }}-latest
+          # NEXT_PUBLIC_* env vars for Next.js apps (web, admin) are injected via BuildKit secrets.
+          # Each GitHub Environment (production/sandbox) must have WEB_ENV and ADMIN_ENV secrets
+          # containing the full .env file contents. API/Workers Dockerfiles ignore these secrets.
+          # WEB_ENV_HASH / ADMIN_ENV_HASH bust the layer cache whenever the env file changes.
+          build-args: |
+            WEB_ENV_HASH=${{ env.WEB_ENV_HASH }}
+            ADMIN_ENV_HASH=${{ env.ADMIN_ENV_HASH }}
+          secrets: |
+            node_auth_token=${{ secrets.GHCR_PAT }}
+          secret-files: |
+            web_env=/tmp/web.env
+            admin_env=/tmp/admin.env
+          cache-from: type=gha,scope=${{ matrix.service }}-${{ inputs.environment }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}-${{ inputs.environment }}
+
+  # ── Deploy to EC2 ─────────────────────────────────────────
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: [prepare, build-and-push]
+    steps:
+      - name: Build service list
+        id: services
+        run: |
+          SERVICES=""
+          if [[ "${{ inputs.deploy_api }}" == "true" ]]; then SERVICES="$SERVICES api"; fi
+          if [[ "${{ inputs.deploy_workers }}" == "true" ]]; then SERVICES="$SERVICES workers"; fi
+          if [[ "${{ inputs.deploy_web }}" == "true" ]]; then SERVICES="$SERVICES web"; fi
+          if [[ "${{ inputs.deploy_admin }}" == "true" ]]; then SERVICES="$SERVICES admin"; fi
+          echo "list=$(echo $SERVICES | xargs)" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        env:
+          IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+          GHCR_IMAGE_PREFIX: ${{ needs.prepare.outputs.image_prefix }}
+          GHCR_TOKEN: ${{ secrets.GHCR_PAT }}
+          GHCR_USER: ${{ github.actor }}
+          DEPLOY_ENV: ${{ inputs.environment }}
+          SERVICES: ${{ steps.services.outputs.list }}
+          DO_BACKUP: ${{ inputs.backup }}
+          DEPLOY_API: ${{ inputs.deploy_api }}
+          PROJECT_DIR_NAME: ${{ inputs.image-name }}
+          API_CONTAINER_PREFIX: ${{ inputs.container-prefix }}
+          ENABLE_DATADOG: ${{ inputs.enable-datadog }}
+          # Datadog release tag — the image tag (env-shortsha) so Datadog tracks
+          # deploys/regressions per release. Only meaningful when ENABLE_DATADOG=true.
+          DD_VERSION: ${{ needs.prepare.outputs.image_tag }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: IMAGE_TAG,GHCR_IMAGE_PREFIX,GHCR_TOKEN,GHCR_USER,DEPLOY_ENV,SERVICES,DO_BACKUP,DEPLOY_API,PROJECT_DIR_NAME,API_CONTAINER_PREFIX,ENABLE_DATADOG,DD_VERSION
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+
+            PROJECT_DIR="$HOME/$PROJECT_DIR_NAME"
+            cd "$PROJECT_DIR"
+
+            echo "=== Deploy Started ==="
+            echo "Environment: $DEPLOY_ENV"
+            echo "Services:    $SERVICES"
+            echo "Image tag:   $IMAGE_TAG"
+            echo ""
+
+            # ── Git pull (latest compose files, migrations, env templates) ──
+            echo "--- Pulling latest code ---"
+            git pull origin main
+
+            # ── Optional backup ──
+            if [[ "$DO_BACKUP" == "true" ]]; then
+              echo "--- Running pre-deploy backup ---"
+              if [[ "$DEPLOY_ENV" == "production" ]]; then
+                make backup
+              else
+                make backup-sandbox
+              fi
+            fi
+
+            # ── Login to GHCR ──
+            echo "--- Logging in to GHCR ---"
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+            # ── Set compose command based on environment ──
+            if [[ "$DEPLOY_ENV" == "production" ]]; then
+              DC="docker compose -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.production.yml"
+              API_CONTAINER="$API_CONTAINER_PREFIX"
+            else
+              DC="docker compose -f infrastructure/docker/docker-compose.sandbox.yml -p ${PROJECT_DIR_NAME}-sandbox"
+              API_CONTAINER="${API_CONTAINER_PREFIX}-sandbox"
+            fi
+
+            # ── Export env vars for compose interpolation ──
+            export IMAGE_TAG="$IMAGE_TAG"
+            export GHCR_IMAGE_PREFIX="$GHCR_IMAGE_PREFIX"
+            # DD_VERSION tags the redeployed app containers for Datadog release tracking.
+            # DD_API_KEY / DD_POSTGRES_PASSWORD are read from infrastructure/docker/.env on the host.
+            export DD_VERSION="$DD_VERSION"
+
+            # ── Pull images ──
+            echo "--- Pulling images ---"
+            $DC pull $SERVICES
+
+            # ── Restart containers (--no-deps: don't touch dependency services) ──
+            echo "--- Restarting containers ---"
+            $DC up -d --no-build --no-deps --force-recreate $SERVICES
+
+            # ── Ensure the Datadog agent is running (production only; repos without a Datadog
+            # profile in their compose files leave ENABLE_DATADOG unset) ──
+            if [[ "$DEPLOY_ENV" == "production" && "$ENABLE_DATADOG" == "true" ]]; then
+              echo "--- Ensuring Datadog agent is up ---"
+              $DC up -d --no-build --no-deps datadog-agent || echo "WARN: datadog-agent not started (check DD_API_KEY in host .env)"
+            fi
+
+            # ── Health check (if API was deployed) ──
+            if [[ "$DEPLOY_API" == "true" ]]; then
+              echo "--- Waiting for API health check ---"
+              HEALTHY=false
+              for i in $(seq 1 10); do
+                sleep 10
+                if docker exec "$API_CONTAINER" wget --no-verbose --tries=1 --spider http://localhost:3001/api/v1/health 2>/dev/null; then
+                  echo "API is healthy (attempt $i)"
+                  HEALTHY=true
+                  break
+                fi
+                echo "Waiting for API... (attempt $i/10)"
+              done
+              if [[ "$HEALTHY" != "true" ]]; then
+                echo "ERROR: API health check failed after 10 attempts"
+                docker logs "$API_CONTAINER" --tail 50
+                exit 1
+              fi
+            fi
+
+            # ── Cleanup dangling images ──
+            echo "--- Cleaning up ---"
+            docker image prune -af
+
+            echo ""
+            echo "=== Deploy Complete ==="
+
+  # ── Summary ───────────────────────────────────────────────
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    needs: [prepare, build-and-push, deploy]
+    if: always()
+    steps:
+      - name: Write job summary
+        uses: actions/github-script@v7
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          DEPLOY_ENV: ${{ inputs.environment }}
+          IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+          SHORT_SHA: ${{ needs.prepare.outputs.short_sha }}
+          DEPLOY_API: ${{ inputs.deploy_api }}
+          DEPLOY_WEB: ${{ inputs.deploy_web }}
+          DEPLOY_ADMIN: ${{ inputs.deploy_admin }}
+          DEPLOY_WORKERS: ${{ inputs.deploy_workers }}
+          BACKUP: ${{ inputs.backup }}
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+        with:
+          script: |
+            const name = process.env.IMAGE_NAME;
+            const env = process.env.DEPLOY_ENV;
+            const tag = process.env.IMAGE_TAG;
+            const sha = process.env.SHORT_SHA;
+            const backup = process.env.BACKUP === 'true' ? '✅' : '⏭️ Skipped';
+            const buildResult = process.env.BUILD_RESULT;
+            const deployResult = process.env.DEPLOY_RESULT;
+
+            const icon = (v) => v === 'true' ? '✅' : '⬜';
+            const statusIcon = (r) => r === 'success' ? '✅' : r === 'skipped' ? '⏭️' : '❌';
+
+            const summary = `## Deploy Summary
+
+            | | |
+            |---|---|
+            | **Environment** | \`${env}\` |
+            | **Commit** | \`${sha}\` |
+            | **Image tag** | \`${tag}\` |
+            | **Backup** | ${backup} |
+
+            ### Services
+
+            | Service | Selected | Image |
+            |---------|----------|-------|
+            | API | ${icon(process.env.DEPLOY_API)} | \`${name}/api:${tag}\` |
+            | Web | ${icon(process.env.DEPLOY_WEB)} | \`${name}/web:${tag}\` |
+            | Admin | ${icon(process.env.DEPLOY_ADMIN)} | \`${name}/admin:${tag}\` |
+            | Workers | ${icon(process.env.DEPLOY_WORKERS)} | \`${name}/workers:${tag}\` |
+
+            ### Result
+
+            | Stage | Status |
+            |-------|--------|
+            | Build & Push | ${statusIcon(buildResult)} ${buildResult} |
+            | Deploy to EC2 | ${statusIcon(deployResult)} ${deployResult} |
+            `;
+
+            await core.summary.addRaw(summary).write();

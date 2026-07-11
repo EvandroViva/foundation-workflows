@@ -1,0 +1,28 @@
+name: Setup Node + pnpm
+description: Sets up pnpm and Node (from .nvmrc) and installs dependencies with a frozen lockfile.
+
+inputs:
+  node-auth-token:
+    description: Token used to install private @evandroviva packages from GitHub Packages
+    required: true
+  install:
+    description: Whether to run pnpm install after setup
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@v4
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version-file: '.nvmrc'
+        cache: 'pnpm'
+
+    - if: ${{ inputs.install == 'true' }}
+      name: Install dependencies
+      shell: bash
+      run: pnpm install --frozen-lockfile
+      env:
+        NODE_AUTH_TOKEN: ${{ inputs.node-auth-token }}
