@@ -248,7 +248,7 @@ jobs:
 
             # ── Set compose command based on environment ──
             if [[ "$DEPLOY_ENV" == "production" ]]; then
-              DC="docker compose -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.production.yml"
+              DC="docker compose -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.production.yml -p ${PROJECT_DIR_NAME}-production"
               API_CONTAINER="$API_CONTAINER_PREFIX"
             else
               DC="docker compose -f infrastructure/docker/docker-compose.sandbox.yml -p ${PROJECT_DIR_NAME}-sandbox"
