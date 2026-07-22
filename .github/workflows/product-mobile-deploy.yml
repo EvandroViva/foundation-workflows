@@ -177,7 +177,10 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: npx dotenv-cli -e ${{ env.ENV_FILE }} -- bash -c 'cd android && ./gradlew bundleRelease'
+        # reactNativeArchitectures restricted to real-device ABIs (x86/x86_64 are emulator-only
+        # and roughly double native build time for no production benefit); --build-cache reuses
+        # unchanged task outputs across CI runs via the gradle-home cache already restored above.
+        run: npx dotenv-cli -e ${{ env.ENV_FILE }} -- bash -c 'cd android && ./gradlew bundleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a --build-cache'
 
       - name: Upload AAB
         uses: actions/upload-artifact@v4
