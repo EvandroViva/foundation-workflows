@@ -156,6 +156,34 @@ jobs:
         run: |
           echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > apps/mobile/android/app/upload-keystore.jks
 
+      - name: Validate release signing credentials
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        # Fails fast (seconds) instead of ~15-20min into Gradle's signReleaseBundle task.
+        # This keystore is PKCS12, and `keytool` silently ignores a mismatched -keypass for
+        # PKCS12 (always decrypts with -storepass instead) — confirmed via its own warning,
+        # "Different store and key passwords not supported for PKCS12 KeyStores" — so it can't
+        # validate ANDROID_KEY_PASSWORD by itself. Hence the explicit equality check below,
+        # plus keytool to confirm ANDROID_KEYSTORE_PASSWORD/ANDROID_KEY_ALIAS actually unlock
+        # the keystore (writing to /dev/null so the file itself is never modified).
+        run: |
+          if [ "$ANDROID_KEYSTORE_PASSWORD" != "$ANDROID_KEY_PASSWORD" ]; then
+            echo "::error::ANDROID_KEY_PASSWORD must equal ANDROID_KEYSTORE_PASSWORD for this PKCS12 keystore."
+            exit 1
+          fi
+          if ! keytool -certreq \
+            -alias "$ANDROID_KEY_ALIAS" \
+            -keystore apps/mobile/android/app/upload-keystore.jks \
+            -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+            -keypass "$ANDROID_KEY_PASSWORD" \
+            -file /dev/null > /dev/null 2>&1; then
+            echo "::error::Could not unlock the release keystore — check ANDROID_KEYSTORE_PASSWORD and ANDROID_KEY_ALIAS ('$ANDROID_KEY_ALIAS')."
+            exit 1
+          fi
+          echo "Release signing credentials OK (alias '$ANDROID_KEY_ALIAS')"
+
       - name: Resolve version code
         id: version
         run: |
