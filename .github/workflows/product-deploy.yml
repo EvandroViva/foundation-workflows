@@ -44,6 +44,11 @@ on:
         required: false
         type: boolean
         default: false
+      runner:
+        description: 'Where non-build jobs run: cloud (GitHub-hosted ubuntu-latest) or self-hosted (self-hosted/Linux/X64). The Docker build-and-push job always runs on GitHub-hosted ARM runners regardless of this input.'
+        required: false
+        type: string
+        default: cloud
 
 concurrency:
   group: deploy-${{ inputs.image-name }}-${{ inputs.environment }}
@@ -53,7 +58,7 @@ jobs:
   # ── Lint & Test ───────────────────────────────────────────
   lint-and-test:
     name: Lint & Test
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -76,7 +81,7 @@ jobs:
   # ── Prepare Build Matrix ──────────────────────────────────
   prepare:
     name: Prepare
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     outputs:
       services: ${{ steps.matrix.outputs.services }}
       image_tag: ${{ steps.meta.outputs.image_tag }}
@@ -180,7 +185,7 @@ jobs:
   # ── Deploy to EC2 ─────────────────────────────────────────
   deploy:
     name: Deploy to EC2
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     needs: [prepare, build-and-push]
     steps:
       - name: Build service list
@@ -307,7 +312,7 @@ jobs:
   # ── Summary ───────────────────────────────────────────────
   summary:
     name: Summary
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     needs: [prepare, build-and-push, deploy]
     if: always()
     steps:

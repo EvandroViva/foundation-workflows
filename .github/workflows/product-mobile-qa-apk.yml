@@ -46,6 +46,11 @@ on:
         required: false
         type: boolean
         default: false
+      runner:
+        description: 'Where jobs run: cloud (GitHub-hosted ubuntu-latest) or self-hosted (self-hosted/Linux/X64)'
+        required: false
+        type: string
+        default: cloud
 
 concurrency:
   group: mobile-qa-apk-${{ inputs.app-name }}-${{ inputs.environment }}-${{ github.ref_name }}
@@ -55,7 +60,7 @@ jobs:
   # ── Lint & Test ───────────────────────────────────────────
   lint-and-test:
     name: Lint & Test
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     if: inputs.skip_tests == false
     permissions:
       contents: read
@@ -81,7 +86,7 @@ jobs:
   # ── Build Android APK ────────────────────────────────────
   build-apk:
     name: Build APK (${{ inputs.environment }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     needs: lint-and-test
     if: always() && (needs.lint-and-test.result == 'success' || needs.lint-and-test.result == 'skipped')
     permissions:
