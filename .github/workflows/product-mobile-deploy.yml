@@ -55,6 +55,11 @@ on:
       version_code:
         required: false
         type: string
+      runner:
+        description: 'Where jobs run: cloud (GitHub-hosted ubuntu-latest) or self-hosted (self-hosted/Linux/X64)'
+        required: false
+        type: string
+        default: cloud
 
 concurrency:
   group: mobile-deploy-${{ inputs.android-package-production }}-${{ inputs.environment }}
@@ -64,7 +69,7 @@ jobs:
   # ── Lint & Test ───────────────────────────────────────────
   lint-and-test:
     name: Lint & Test
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
@@ -89,7 +94,7 @@ jobs:
   # ── Build Android AAB ────────────────────────────────────
   build-android:
     name: Build Android
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     needs: lint-and-test
     if: inputs.deploy_android == true
     permissions:
@@ -192,7 +197,7 @@ jobs:
   # ── Deploy to Google Play ────────────────────────────────
   deploy-play-store:
     name: Deploy to Google Play
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     needs: build-android
     if: inputs.deploy_android == true
     permissions: {}
@@ -215,7 +220,7 @@ jobs:
   # ── Deploy iOS (push to deploy branch) ───────────────────
   deploy-ios:
     name: Deploy iOS
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     needs: lint-and-test
     if: inputs.deploy_ios == true
     permissions:
@@ -243,7 +248,7 @@ jobs:
   # ── Summary ──────────────────────────────────────────────
   summary:
     name: Summary
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     needs: [deploy-play-store, deploy-ios]
     if: always()
     permissions: {}
