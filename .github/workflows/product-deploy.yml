@@ -45,7 +45,7 @@ on:
         type: boolean
         default: false
       runner:
-        description: 'Where non-build jobs run: cloud (GitHub-hosted ubuntu-latest) or self-hosted (self-hosted/Linux/X64). The Docker build-and-push job always runs on GitHub-hosted ARM runners regardless of this input.'
+        description: 'Where jobs run: cloud (GitHub-hosted: ubuntu-latest, or ubuntu-24.04-arm for the Docker build) or self-hosted (self-hosted/Linux/X64, or self-hosted/Linux/ARM64 for the Docker build)'
         required: false
         type: string
         default: cloud
@@ -121,7 +121,7 @@ jobs:
   # ── Build & Push Docker Images ────────────────────────────
   build-and-push:
     name: Build ${{ matrix.service }}
-    runs-on: ubuntu-24.04-arm
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","ARM64"]') || 'ubuntu-24.04-arm' }}
     needs: [lint-and-test, prepare]
     if: needs.prepare.outputs.services != '[]'
     environment: ${{ inputs.environment }}
