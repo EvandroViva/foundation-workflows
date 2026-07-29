@@ -179,8 +179,13 @@ jobs:
           secret-files: |
             web_env=/tmp/web.env
             admin_env=/tmp/admin.env
-          cache-from: type=gha,scope=${{ matrix.service }}-${{ inputs.environment }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.service }}-${{ inputs.environment }}
+          # Self-hosted ARM64 runners use a host-mounted local cache dir (see docker-runner's
+          # docker-compose-raspberry.yml) instead of the gha backend: it's shared across all
+          # self-hosted containers for this product regardless of which one lands the job, has
+          # no 10GB/eviction limit, and doesn't race with the other concurrent matrix builds
+          # over the network the way type=gha did (caused "blob sha256:...: not found" errors).
+          cache-from: ${{ inputs.runner == 'self-hosted' && format('type=local,src=/buildx-cache/{0}-{1}', matrix.service, inputs.environment) || format('type=gha,scope={0}-{1}', matrix.service, inputs.environment) }}
+          cache-to: ${{ inputs.runner == 'self-hosted' && format('type=local,dest=/buildx-cache/{0}-{1},mode=max', matrix.service, inputs.environment) || format('type=gha,mode=max,scope={0}-{1}', matrix.service, inputs.environment) }}
 
   # ── Deploy to EC2 ─────────────────────────────────────────
   deploy:
