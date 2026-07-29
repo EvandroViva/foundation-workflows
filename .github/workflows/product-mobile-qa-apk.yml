@@ -145,7 +145,7 @@ jobs:
               ;;
           esac
           echo "::group::Validate $GSERVICES_FILE"
-          python3 -c "import json; json.load(open('$GSERVICES_FILE')); print('Valid JSON ✓')"
+          jq empty "$GSERVICES_FILE" && echo "Valid JSON ✓"
           echo "::endgroup::"
 
       - name: Write environment file
