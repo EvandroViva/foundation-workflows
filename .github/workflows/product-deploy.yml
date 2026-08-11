@@ -211,18 +211,29 @@ jobs:
       # Sandbox's EC2_HOST is the Raspberry Pi, which only has a private LAN address —
       # a GitHub-hosted runner can't reach it directly. Join the tailnet first so the SSH
       # step below can dial the Pi's Tailscale IP. Production keeps its public EC2 address
-      # and skips this entirely.
+      # and skips this entirely. Also skipped when runner == self-hosted: those runners
+      # already run as containers on the Pi itself (no tunnel needed to reach it), and
+      # they only have docker.sock mounted — no /dev/net/tun, so tailscaled couldn't even
+      # bring up an interface there.
       - name: Connect to Tailscale
-        if: inputs.environment == 'sandbox'
+        if: inputs.environment == 'sandbox' && inputs.runner != 'self-hosted'
         uses: tailscale/github-action@v3
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
 
+      # Native ssh instead of a Docker-based action: appleboy/ssh-action runs as a
+      # sibling container with its own network namespace, so it can't see the
+      # tailscale0 route the previous step configured on the runner host — it only
+      # works for publicly routable hosts (production's EC2). A plain `run:` step
+      # executes directly in the runner's own process/network namespace, so it can
+      # reach the sandbox host's Tailscale IP too. Same remote script either way.
       - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1
         env:
+          SSH_HOST: ${{ secrets.EC2_HOST }}
+          SSH_USER: ${{ secrets.EC2_USER }}
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
           GHCR_IMAGE_PREFIX: ${{ needs.prepare.outputs.image_prefix }}
           GHCR_TOKEN: ${{ secrets.GHCR_PAT }}
@@ -237,99 +248,121 @@ jobs:
           # Datadog release tag — the image tag (env-shortsha) so Datadog tracks
           # deploys/regressions per release. Only meaningful when ENABLE_DATADOG=true.
           DD_VERSION: ${{ needs.prepare.outputs.image_tag }}
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          envs: IMAGE_TAG,GHCR_IMAGE_PREFIX,GHCR_TOKEN,GHCR_USER,DEPLOY_ENV,SERVICES,DO_BACKUP,DEPLOY_API,PROJECT_DIR_NAME,API_CONTAINER_PREFIX,ENABLE_DATADOG,DD_VERSION
-          command_timeout: 30m
-          script: |
-            set -euo pipefail
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
 
-            PROJECT_DIR="$HOME/$PROJECT_DIR_NAME"
-            cd "$PROJECT_DIR"
+          {
+            # First block: substituted locally (these are single-line, GH-Actions-sourced
+            # values) into literal `export` lines the remote shell will see.
+            cat <<ENVBLOCK
+          export IMAGE_TAG="$IMAGE_TAG"
+          export GHCR_IMAGE_PREFIX="$GHCR_IMAGE_PREFIX"
+          export GHCR_TOKEN="$GHCR_TOKEN"
+          export GHCR_USER="$GHCR_USER"
+          export DEPLOY_ENV="$DEPLOY_ENV"
+          export SERVICES="$SERVICES"
+          export DO_BACKUP="$DO_BACKUP"
+          export DEPLOY_API="$DEPLOY_API"
+          export PROJECT_DIR_NAME="$PROJECT_DIR_NAME"
+          export API_CONTAINER_PREFIX="$API_CONTAINER_PREFIX"
+          export ENABLE_DATADOG="$ENABLE_DATADOG"
+          export DD_VERSION="$DD_VERSION"
+          ENVBLOCK
+            # Second block: quoted heredoc, sent verbatim — every $VAR here is meant to
+            # be evaluated on the remote host, not by this local shell.
+            cat <<'SCRIPTBODY'
+          set -euo pipefail
 
-            echo "=== Deploy Started ==="
-            echo "Environment: $DEPLOY_ENV"
-            echo "Services:    $SERVICES"
-            echo "Image tag:   $IMAGE_TAG"
-            echo ""
+          PROJECT_DIR="$HOME/$PROJECT_DIR_NAME"
+          cd "$PROJECT_DIR"
 
-            # ── Git pull (latest compose files, migrations, env templates) ──
-            echo "--- Pulling latest code ---"
-            git pull origin main
+          echo "=== Deploy Started ==="
+          echo "Environment: $DEPLOY_ENV"
+          echo "Services:    $SERVICES"
+          echo "Image tag:   $IMAGE_TAG"
+          echo ""
 
-            # ── Optional backup ──
-            if [[ "$DO_BACKUP" == "true" ]]; then
-              echo "--- Running pre-deploy backup ---"
-              if [[ "$DEPLOY_ENV" == "production" ]]; then
-                make backup
-              else
-                make backup-sandbox
-              fi
-            fi
+          # ── Git pull (latest compose files, migrations, env templates) ──
+          echo "--- Pulling latest code ---"
+          git pull origin main
 
-            # ── Login to GHCR ──
-            echo "--- Logging in to GHCR ---"
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-
-            # ── Set compose command based on environment ──
+          # ── Optional backup ──
+          if [[ "$DO_BACKUP" == "true" ]]; then
+            echo "--- Running pre-deploy backup ---"
             if [[ "$DEPLOY_ENV" == "production" ]]; then
-              DC="docker compose -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.production.yml -p ${PROJECT_DIR_NAME}-production"
-              API_CONTAINER="$API_CONTAINER_PREFIX"
+              make backup
             else
-              DC="docker compose -f infrastructure/docker/docker-compose.sandbox.yml -p ${PROJECT_DIR_NAME}-sandbox"
-              API_CONTAINER="${API_CONTAINER_PREFIX}-sandbox"
+              make backup-sandbox
             fi
+          fi
 
-            # ── Export env vars for compose interpolation ──
-            export IMAGE_TAG="$IMAGE_TAG"
-            export GHCR_IMAGE_PREFIX="$GHCR_IMAGE_PREFIX"
-            # DD_VERSION tags the redeployed app containers for Datadog release tracking.
-            # DD_API_KEY / DD_POSTGRES_PASSWORD are read from infrastructure/docker/.env on the host.
-            export DD_VERSION="$DD_VERSION"
+          # ── Login to GHCR ──
+          echo "--- Logging in to GHCR ---"
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
-            # ── Pull images ──
-            echo "--- Pulling images ---"
-            $DC pull $SERVICES
+          # ── Set compose command based on environment ──
+          if [[ "$DEPLOY_ENV" == "production" ]]; then
+            DC="docker compose -f infrastructure/docker/docker-compose.yml -f infrastructure/docker/docker-compose.production.yml -p ${PROJECT_DIR_NAME}-production"
+            API_CONTAINER="$API_CONTAINER_PREFIX"
+          else
+            DC="docker compose -f infrastructure/docker/docker-compose.sandbox.yml -p ${PROJECT_DIR_NAME}-sandbox"
+            API_CONTAINER="${API_CONTAINER_PREFIX}-sandbox"
+          fi
 
-            # ── Restart containers (--no-deps: don't touch dependency services) ──
-            echo "--- Restarting containers ---"
-            $DC up -d --no-build --no-deps --force-recreate $SERVICES
+          # ── Export env vars for compose interpolation ──
+          export IMAGE_TAG="$IMAGE_TAG"
+          export GHCR_IMAGE_PREFIX="$GHCR_IMAGE_PREFIX"
+          # DD_VERSION tags the redeployed app containers for Datadog release tracking.
+          # DD_API_KEY / DD_POSTGRES_PASSWORD are read from infrastructure/docker/.env on the host.
+          export DD_VERSION="$DD_VERSION"
 
-            # ── Ensure the Datadog agent is running (production only; repos without a Datadog
-            # profile in their compose files leave ENABLE_DATADOG unset) ──
-            if [[ "$DEPLOY_ENV" == "production" && "$ENABLE_DATADOG" == "true" ]]; then
-              echo "--- Ensuring Datadog agent is up ---"
-              $DC up -d --no-build --no-deps datadog-agent || echo "WARN: datadog-agent not started (check DD_API_KEY in host .env)"
-            fi
+          # ── Pull images ──
+          echo "--- Pulling images ---"
+          $DC pull $SERVICES
 
-            # ── Health check (if API was deployed) ──
-            if [[ "$DEPLOY_API" == "true" ]]; then
-              echo "--- Waiting for API health check ---"
-              HEALTHY=false
-              for i in $(seq 1 10); do
-                sleep 10
-                if docker exec "$API_CONTAINER" wget --no-verbose --tries=1 --spider http://localhost:3001/api/v1/health 2>/dev/null; then
-                  echo "API is healthy (attempt $i)"
-                  HEALTHY=true
-                  break
-                fi
-                echo "Waiting for API... (attempt $i/10)"
-              done
-              if [[ "$HEALTHY" != "true" ]]; then
-                echo "ERROR: API health check failed after 10 attempts"
-                docker logs "$API_CONTAINER" --tail 50
-                exit 1
+          # ── Restart containers (--no-deps: don't touch dependency services) ──
+          echo "--- Restarting containers ---"
+          $DC up -d --no-build --no-deps --force-recreate $SERVICES
+
+          # ── Ensure the Datadog agent is running (production only; repos without a Datadog
+          # profile in their compose files leave ENABLE_DATADOG unset) ──
+          if [[ "$DEPLOY_ENV" == "production" && "$ENABLE_DATADOG" == "true" ]]; then
+            echo "--- Ensuring Datadog agent is up ---"
+            $DC up -d --no-build --no-deps datadog-agent || echo "WARN: datadog-agent not started (check DD_API_KEY in host .env)"
+          fi
+
+          # ── Health check (if API was deployed) ──
+          if [[ "$DEPLOY_API" == "true" ]]; then
+            echo "--- Waiting for API health check ---"
+            HEALTHY=false
+            for i in $(seq 1 10); do
+              sleep 10
+              if docker exec "$API_CONTAINER" wget --no-verbose --tries=1 --spider http://localhost:3001/api/v1/health 2>/dev/null; then
+                echo "API is healthy (attempt $i)"
+                HEALTHY=true
+                break
               fi
+              echo "Waiting for API... (attempt $i/10)"
+            done
+            if [[ "$HEALTHY" != "true" ]]; then
+              echo "ERROR: API health check failed after 10 attempts"
+              docker logs "$API_CONTAINER" --tail 50
+              exit 1
             fi
+          fi
 
-            # ── Cleanup dangling images ──
-            echo "--- Cleaning up ---"
-            docker image prune -af
+          # ── Cleanup dangling images ──
+          echo "--- Cleaning up ---"
+          docker image prune -af
 
-            echo ""
-            echo "=== Deploy Complete ==="
+          echo ""
+          echo "=== Deploy Complete ==="
+          SCRIPTBODY
+          } | ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -i ~/.ssh/deploy_key "$SSH_USER@$SSH_HOST" bash -s
 
   # ── Summary ───────────────────────────────────────────────
   summary:
