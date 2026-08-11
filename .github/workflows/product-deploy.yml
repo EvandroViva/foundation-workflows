@@ -211,9 +211,12 @@ jobs:
       # Sandbox's EC2_HOST is the Raspberry Pi, which only has a private LAN address —
       # a GitHub-hosted runner can't reach it directly. Join the tailnet first so the SSH
       # step below can dial the Pi's Tailscale IP. Production keeps its public EC2 address
-      # and skips this entirely.
+      # and skips this entirely. Also skipped when runner == self-hosted: those runners
+      # already run as containers on the Pi itself (no tunnel needed to reach it), and
+      # they only have docker.sock mounted — no /dev/net/tun, so tailscaled couldn't even
+      # bring up an interface there.
       - name: Connect to Tailscale
-        if: inputs.environment == 'sandbox'
+        if: inputs.environment == 'sandbox' && inputs.runner != 'self-hosted'
         uses: tailscale/github-action@v3
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
