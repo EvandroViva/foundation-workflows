@@ -192,6 +192,11 @@ jobs:
     name: Deploy to EC2
     runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     needs: [prepare, build-and-push]
+    # Binds sandbox/production Environment secrets (EC2_HOST/EC2_USER/EC2_SSH_KEY,
+    # TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET) — falls back to repo-level secrets of the
+    # same name when an Environment doesn't override them (production keeps working
+    # unchanged since no production-scoped overrides exist).
+    environment: ${{ inputs.environment }}
     steps:
       - name: Build service list
         id: services
@@ -202,6 +207,18 @@ jobs:
           if [[ "${{ inputs.deploy_web }}" == "true" ]]; then SERVICES="$SERVICES web"; fi
           if [[ "${{ inputs.deploy_admin }}" == "true" ]]; then SERVICES="$SERVICES admin"; fi
           echo "list=$(echo $SERVICES | xargs)" >> "$GITHUB_OUTPUT"
+
+      # Sandbox's EC2_HOST is the Raspberry Pi, which only has a private LAN address —
+      # a GitHub-hosted runner can't reach it directly. Join the tailnet first so the SSH
+      # step below can dial the Pi's Tailscale IP. Production keeps its public EC2 address
+      # and skips this entirely.
+      - name: Connect to Tailscale
+        if: inputs.environment == 'sandbox'
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
