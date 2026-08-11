@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       runner:
-        description: 'Where jobs run: cloud (GitHub-hosted ubuntu-latest) or self-hosted (self-hosted/Linux/X64)'
+        description: 'Where jobs run: cloud (GitHub-hosted ubuntu-latest) or self-hosted (self-hosted/Linux/ARM64, the Raspberry Pi runners)'
         required: false
         type: string
         default: cloud
@@ -21,7 +21,7 @@ jobs:
   # ── Detect Changes ────────────────────────────────────────
   changes:
     name: Detect Changes
-    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","ARM64"]') || 'ubuntu-latest' }}
     outputs:
       api: ${{ steps.filter.outputs.api }}
       workers: ${{ steps.filter.outputs.workers }}
@@ -47,7 +47,7 @@ jobs:
   # ── Format Check ──────────────────────────────────────────
   format:
     name: Format
-    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","ARM64"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -61,7 +61,7 @@ jobs:
   # ── Lint ──────────────────────────────────────────────────
   lint:
     name: Lint
-    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","ARM64"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -83,7 +83,7 @@ jobs:
     name: Test API
     needs: [changes]
     if: ${{ needs.changes.outputs.api == 'true' }}
-    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","ARM64"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -105,7 +105,7 @@ jobs:
     name: Test Workers
     needs: [changes]
     if: ${{ needs.changes.outputs.workers == 'true' }}
-    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","ARM64"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -124,7 +124,7 @@ jobs:
     name: Test Mobile
     needs: [changes]
     if: ${{ needs.changes.outputs.mobile == 'true' }}
-    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","ARM64"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -141,7 +141,7 @@ jobs:
   # ── Build ─────────────────────────────────────────────────
   build:
     name: Build
-    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","ARM64"]') || 'ubuntu-latest' }}
     needs: [format, lint, test-api, test-workers, test-mobile]
     if: >-
       always() &&
