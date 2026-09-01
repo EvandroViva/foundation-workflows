@@ -97,6 +97,7 @@ jobs:
     runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     needs: lint-and-test
     if: inputs.deploy_android == true
+    environment: ${{ inputs.environment }}
     permissions:
       contents: read
     steps:
