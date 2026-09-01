@@ -138,6 +138,7 @@ jobs:
               "EXPO_PUBLIC_APP_SCHEME=${{ inputs.sandbox-app-scheme }}" \
               "EXPO_PUBLIC_WEB_URL=${{ inputs.sandbox-web-url }}" \
               "EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID=${{ secrets.GOOGLE_WEB_CLIENT_ID }}" \
+              "EXPO_PUBLIC_AMPLITUDE_API_KEY=${{ secrets.AMPLITUDE_API_KEY }}" \
               > .env.sandbox
             echo "ENV_FILE=.env.sandbox" >> "$GITHUB_ENV"
           else
@@ -147,6 +148,7 @@ jobs:
               "EXPO_PUBLIC_APP_SCHEME=${{ inputs.production-app-scheme }}" \
               "EXPO_PUBLIC_WEB_URL=${{ inputs.production-web-url }}" \
               "EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID=${{ secrets.GOOGLE_WEB_CLIENT_ID }}" \
+              "EXPO_PUBLIC_AMPLITUDE_API_KEY=${{ secrets.AMPLITUDE_API_KEY }}" \
               > .env.production
             echo "ENV_FILE=.env.production" >> "$GITHUB_ENV"
           fi
