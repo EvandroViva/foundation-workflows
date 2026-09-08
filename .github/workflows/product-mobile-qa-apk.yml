@@ -117,6 +117,7 @@ jobs:
       - uses: EvandroViva/foundation-workflows/.github/actions/setup-node-pnpm@main
         with:
           node-auth-token: ${{ secrets.GHCR_PAT }}
+          filter: '${{ inputs.package-scope }}/mobile...'
 
       - uses: actions/setup-java@v4
         with:

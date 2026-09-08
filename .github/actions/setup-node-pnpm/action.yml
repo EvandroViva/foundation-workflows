@@ -9,6 +9,10 @@ inputs:
     description: Whether to run pnpm install after setup
     required: false
     default: 'true'
+  filter:
+    description: 'Optional pnpm --filter expression to scope the install to specific workspace packages (and their dependencies), e.g. "@scope/mobile...". Leave empty to install the whole workspace.'
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -23,6 +27,11 @@ runs:
     - if: ${{ inputs.install == 'true' }}
       name: Install dependencies
       shell: bash
-      run: pnpm install --frozen-lockfile
+      run: |
+        if [ -n "${{ inputs.filter }}" ]; then
+          pnpm install --frozen-lockfile --filter "${{ inputs.filter }}"
+        else
+          pnpm install --frozen-lockfile
+        fi
       env:
         NODE_AUTH_TOKEN: ${{ inputs.node-auth-token }}
