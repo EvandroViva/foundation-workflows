@@ -45,10 +45,6 @@ on:
         required: false
         type: boolean
         default: true
-      track:
-        description: 'Google Play track (Android only)'
-        required: true
-        type: string
       force_draft:
         description: 'Force status=draft on the internal track (Android only). Needed for a brand-new app''s first-ever release, which the Play API rejects as "completed" until it has been published manually once from the Play Console.'
         required: false
@@ -105,6 +101,8 @@ jobs:
     environment: ${{ inputs.environment }}
     permissions:
       contents: read
+    outputs:
+      version-code: ${{ steps.version.outputs.code }}
     steps:
       - uses: actions/checkout@v4
 
@@ -234,9 +232,9 @@ jobs:
           path: apps/mobile/android/app/build/outputs/bundle/release/*.aab
           retention-days: 30
 
-  # ── Deploy to Google Play ────────────────────────────────
-  deploy-play-store:
-    name: Deploy to Google Play
+  # ── Deploy to Google Play: internal (automatic) ──────────
+  deploy-internal:
+    name: Deploy to Google Play (internal)
     runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     needs: build-android
     if: inputs.deploy_android == true
@@ -254,11 +252,56 @@ jobs:
           serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
           packageName: ${{ inputs.environment == 'sandbox' && inputs.android-package-sandbox || inputs.android-package-production }}
           releaseFiles: '*.aab'
-          track: ${{ inputs.track }}
-          # internal: rolls out immediately to the internal testing group (no review needed there),
-          # unless force_draft bootstraps a brand-new app's very first release (see input above).
-          # beta/production: stays a draft for manual review before reaching a wider audience.
-          status: ${{ (inputs.track == 'internal' && !inputs.force_draft) && 'completed' || 'draft' }}
+          track: internal
+          # Rolls out immediately to the internal testing group (no review needed there), unless
+          # force_draft bootstraps a brand-new app's very first release (see input above).
+          status: ${{ inputs.force_draft && 'draft' || 'completed' }}
+
+  # ── Promote to beta (gated — requires manual approval) ───
+  promote-beta:
+    name: Promote to Google Play (beta)
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    needs: deploy-internal
+    if: inputs.deploy_android == true && inputs.environment == 'production'
+    permissions: {}
+    environment: google-play-beta
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: EvandroViva/foundation-workflows
+          ref: main
+
+      - name: Promote internal release to beta
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          node scripts/google-play-promote.mjs \
+            --package ${{ inputs.android-package-production }} \
+            --to beta \
+            --version-code ${{ needs.build-android.outputs.version-code }}
+
+  # ── Promote to production (gated — requires manual approval) ─
+  promote-production:
+    name: Promote to Google Play (production)
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    needs: promote-beta
+    if: inputs.deploy_android == true && inputs.environment == 'production'
+    permissions: {}
+    environment: google-play-production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: EvandroViva/foundation-workflows
+          ref: main
+
+      - name: Promote beta release to production
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          node scripts/google-play-promote.mjs \
+            --package ${{ inputs.android-package-production }} \
+            --to production \
+            --version-code ${{ needs.build-android.outputs.version-code }}
 
   # ── Deploy iOS (push to deploy branch) ───────────────────
   deploy-ios:
@@ -292,7 +335,7 @@ jobs:
   summary:
     name: Summary
     runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
-    needs: [deploy-play-store, deploy-ios]
+    needs: [deploy-internal, promote-beta, promote-production, deploy-ios]
     if: always()
     permissions: {}
     steps:
@@ -303,10 +346,11 @@ jobs:
           SHORT_SHA: ${{ github.sha }}
           DEPLOY_ANDROID: ${{ inputs.deploy_android }}
           DEPLOY_IOS: ${{ inputs.deploy_ios }}
-          TRACK: ${{ inputs.track }}
           VERSION_NAME: ${{ inputs.version_name }}
           VERSION_CODE: ${{ inputs.version_code }}
-          ANDROID_BUILD_RESULT: ${{ needs.deploy-play-store.result }}
+          INTERNAL_RESULT: ${{ needs.deploy-internal.result }}
+          BETA_RESULT: ${{ needs.promote-beta.result }}
+          PRODUCTION_RESULT: ${{ needs.promote-production.result }}
           IOS_RESULT: ${{ needs.deploy-ios.result }}
         with:
           script: |
@@ -314,15 +358,16 @@ jobs:
             const sha = process.env.SHORT_SHA.substring(0, 7);
             const deployAndroid = process.env.DEPLOY_ANDROID;
             const deployIos = process.env.DEPLOY_IOS;
-            const track = process.env.TRACK;
             const versionName = process.env.VERSION_NAME || '(default)';
             const versionCode = process.env.VERSION_CODE || '(auto)';
-            const androidResult = process.env.ANDROID_BUILD_RESULT;
+            const internalResult = process.env.INTERNAL_RESULT;
+            const betaResult = process.env.BETA_RESULT;
+            const productionResult = process.env.PRODUCTION_RESULT;
             const iosResult = process.env.IOS_RESULT;
             const iosBranch = env === 'production' ? 'deploy' : 'deploy-sandbox';
 
             const icon = (v) => v === 'true' ? '✅' : '⬜';
-            const statusIcon = (r) => r === 'success' ? '✅' : r === 'skipped' ? '⏭️' : '❌';
+            const statusIcon = (r) => r === 'success' ? '✅' : r === 'skipped' ? '⏭️' : r === 'cancelled' ? '⏸️' : '❌';
 
             const summary = `## Mobile Deploy Summary
 
@@ -330,12 +375,15 @@ jobs:
             |---|---|
             | **Environment** | \`${env}\` |
             | **Commit** | \`${sha}\` |
+            | **Version** | \`${versionName}\` (code: \`${versionCode}\`) |
 
             ### Platforms
 
             | Platform | Selected | Details | Result |
             |----------|----------|---------|--------|
-            | Android | ${icon(deployAndroid)} | Track: \`${track}\`, Version: \`${versionName}\` (code: \`${versionCode}\`) | ${statusIcon(androidResult)} ${androidResult} |
+            | Android — internal | ${icon(deployAndroid)} | Auto-release to internal testers | ${statusIcon(internalResult)} ${internalResult} |
+            | Android — beta | ${icon(deployAndroid)} | Requires approval on the \`google-play-beta\` environment | ${statusIcon(betaResult)} ${betaResult} |
+            | Android — production | ${icon(deployAndroid)} | Requires approval on the \`google-play-production\` environment | ${statusIcon(productionResult)} ${productionResult} |
             | iOS | ${icon(deployIos)} | Branch: \`${iosBranch}\` | ${statusIcon(iosResult)} ${iosResult} |
             `;
 
