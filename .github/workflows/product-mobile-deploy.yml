@@ -250,7 +250,11 @@ jobs:
           packageName: ${{ inputs.environment == 'sandbox' && inputs.android-package-sandbox || inputs.android-package-production }}
           releaseFiles: '*.aab'
           track: ${{ inputs.track }}
-          status: draft
+          # internal: rolls out immediately to the internal testing group (no review needed there).
+          # beta/production: stays a draft for manual review before reaching a wider audience.
+          # Note: a brand-new app's very first release must still be published manually from the
+          # Play Console — the API rejects status "completed" until that one-time bootstrap is done.
+          status: ${{ inputs.track == 'internal' && 'completed' || 'draft' }}
 
   # ── Deploy iOS (push to deploy branch) ───────────────────
   deploy-ios:
