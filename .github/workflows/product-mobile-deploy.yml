@@ -49,6 +49,11 @@ on:
         description: 'Google Play track (Android only)'
         required: true
         type: string
+      force_draft:
+        description: 'Force status=draft on the internal track (Android only). Needed for a brand-new app''s first-ever release, which the Play API rejects as "completed" until it has been published manually once from the Play Console.'
+        required: false
+        type: boolean
+        default: false
       version_name:
         required: false
         type: string
@@ -250,7 +255,10 @@ jobs:
           packageName: ${{ inputs.environment == 'sandbox' && inputs.android-package-sandbox || inputs.android-package-production }}
           releaseFiles: '*.aab'
           track: ${{ inputs.track }}
-          status: draft
+          # internal: rolls out immediately to the internal testing group (no review needed there),
+          # unless force_draft bootstraps a brand-new app's very first release (see input above).
+          # beta/production: stays a draft for manual review before reaching a wider audience.
+          status: ${{ (inputs.track == 'internal' && !inputs.force_draft) && 'completed' || 'draft' }}
 
   # ── Deploy iOS (push to deploy branch) ───────────────────
   deploy-ios:
