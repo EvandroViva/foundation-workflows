@@ -194,8 +194,10 @@ jobs:
     needs: [prepare, build-and-push]
     # Binds sandbox/production Environment secrets (EC2_HOST/EC2_USER/EC2_SSH_KEY,
     # TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET) — falls back to repo-level secrets of the
-    # same name when an Environment doesn't override them (production keeps working
-    # unchanged since no production-scoped overrides exist).
+    # same name when an Environment doesn't override them. Production now sets its
+    # own EC2_HOST (Tailscale IP) and TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET at the
+    # Environment level; EC2_USER/EC2_SSH_KEY are unchanged and still fall back to
+    # the repo-level secrets (same SSH key/user, only the network path changed).
     environment: ${{ inputs.environment }}
     steps:
       - name: Build service list
@@ -208,20 +210,23 @@ jobs:
           if [[ "${{ inputs.deploy_admin }}" == "true" ]]; then SERVICES="$SERVICES admin"; fi
           echo "list=$(echo $SERVICES | xargs)" >> "$GITHUB_OUTPUT"
 
-      # Sandbox's EC2_HOST is the Raspberry Pi, which only has a private LAN address —
-      # a GitHub-hosted runner can't reach it directly. Join the tailnet first so the SSH
-      # step below can dial the Pi's Tailscale IP. Production keeps its public EC2 address
-      # and skips this entirely. Also skipped when runner == self-hosted: those runners
-      # already run as containers on the Pi itself (no tunnel needed to reach it), and
-      # they only have docker.sock mounted — no /dev/net/tun, so tailscaled couldn't even
-      # bring up an interface there.
+      # Sandbox's EC2_HOST is the Raspberry Pi, which only has a private LAN address,
+      # and production's EC2_HOST is now this same shared VPS's Tailscale IP too (its
+      # public IP is being phased out as the normal access path — see workspace
+      # AGENTS.md's "Production VPS (EC2)" section). Either way a GitHub-hosted runner
+      # can't reach a Tailscale-only address directly, so join the tailnet first here.
+      # Production uses a separate OAuth client/tag (tag:server) from sandbox's tag:ci,
+      # each scoped to its own environment's TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET secrets.
+      # Skipped when runner == self-hosted: those runners already run as containers on
+      # the Pi itself (no tunnel needed to reach it), and they only have docker.sock
+      # mounted — no /dev/net/tun, so tailscaled couldn't even bring up an interface there.
       - name: Connect to Tailscale
-        if: inputs.environment == 'sandbox' && inputs.runner != 'self-hosted'
+        if: (inputs.environment == 'sandbox' || inputs.environment == 'production') && inputs.runner != 'self-hosted'
         uses: tailscale/github-action@v3
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:ci
+          tags: ${{ inputs.environment == 'production' && 'tag:server' || 'tag:ci' }}
 
       # Native ssh instead of a Docker-based action: appleboy/ssh-action runs as a
       # sibling container with its own network namespace, so it can't see the
