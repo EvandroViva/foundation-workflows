@@ -228,6 +228,19 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: ${{ inputs.environment == 'production' && 'tag:server' || 'tag:ci' }}
 
+      # tailscale/github-action@v3 exits 0 even when every `tailscale up` retry fails
+      # (e.g. 400 "requested tags are invalid or not permitted"), so the failure only
+      # surfaced later as an opaque SSH connect timeout. Fail here with the real cause.
+      - name: Verify Tailscale is connected
+        if: (inputs.environment == 'sandbox' || inputs.environment == 'production') && inputs.runner != 'self-hosted'
+        run: |
+          state=$(tailscale status --json 2>/dev/null | jq -r '.BackendState // "Unknown"' || true)
+          if [[ "$state" != "Running" ]]; then
+            echo "::error::Tailscale did not connect (BackendState=${state:-Unknown}). Check the 'Connect to Tailscale' step logs and the TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET client's allowed tags."
+            exit 1
+          fi
+          echo "Tailscale is up"
+
       # Native ssh instead of a Docker-based action: appleboy/ssh-action runs as a
       # sibling container with its own network namespace, so it can't see the
       # tailscale0 route the previous step configured on the runner host — it only
