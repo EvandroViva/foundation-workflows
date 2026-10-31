@@ -1,0 +1,161 @@
+name: Product Version Bump (reusable)
+
+# Bumps a semver string in one file of the calling repo and pushes the commit
+# straight to the default branch (no PR, no approval).
+#
+# Pushing to a branch protected by a ruleset that requires PRs only works if the
+# pushing identity is a bypass actor. Two options:
+#   1. Pass a `RELEASE_PUSH_TOKEN` secret (PAT / GitHub App token of someone who
+#      can bypass the ruleset, e.g. a repo admin), or
+#   2. Add the "GitHub Actions" app to the ruleset's bypass list and leave the
+#      secret unset (falls back to the workflow's GITHUB_TOKEN).
+
+on:
+  workflow_call:
+    inputs:
+      bump:
+        description: 'Which semver part to bump: patch, minor or major'
+        required: true
+        type: string
+      file:
+        description: 'File (relative to repo root) that holds the version'
+        required: false
+        type: string
+        default: package.json
+      pattern:
+        description: 'JavaScript regex source with exactly ONE capture group around the X.Y.Z version. All matches after `anchor` are rewritten and must agree on the current version.'
+        required: false
+        type: string
+        default: '"version":\s*"(\d+\.\d+\.\d+)"'
+      anchor:
+        description: 'Optional literal text; only matches located after its first occurrence are bumped (e.g. "production: {")'
+        required: false
+        type: string
+        default: ''
+      branch:
+        description: 'Branch to bump and push to. The caller must be running on it.'
+        required: false
+        type: string
+        default: main
+      runner:
+        description: 'Where the job runs: cloud (GitHub-hosted ubuntu-latest) or self-hosted (self-hosted/Linux/ARM64)'
+        required: false
+        type: string
+        default: cloud
+    secrets:
+      RELEASE_PUSH_TOKEN:
+        description: 'Token allowed to bypass the branch ruleset. Falls back to GITHUB_TOKEN when unset.'
+        required: false
+    outputs:
+      old-version:
+        description: 'Version before the bump'
+        value: ${{ jobs.bump.outputs.old-version }}
+      new-version:
+        description: 'Version after the bump'
+        value: ${{ jobs.bump.outputs.new-version }}
+
+jobs:
+  bump:
+    name: Bump version
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","ARM64"]') || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      old-version: ${{ steps.bump.outputs.old }}
+      new-version: ${{ steps.bump.outputs.new }}
+    # Serialize bumps so two runs never compute the same next version.
+    concurrency:
+      group: version-bump-${{ github.repository }}-${{ inputs.branch }}
+      cancel-in-progress: false
+    steps:
+      - name: Validate inputs
+        env:
+          BUMP: ${{ inputs.bump }}
+          BRANCH: ${{ inputs.branch }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          case "$BUMP" in
+            patch|minor|major) ;;
+            *) echo "::error::bump must be patch, minor or major (got '$BUMP')"; exit 1 ;;
+          esac
+          if [ "$REF_NAME" != "$BRANCH" ]; then
+            echo "::error::Run this workflow from '$BRANCH' (running on '$REF_NAME')"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          token: ${{ secrets.RELEASE_PUSH_TOKEN || github.token }}
+          fetch-depth: 1
+
+      - name: Bump version
+        id: bump
+        env:
+          BUMP: ${{ inputs.bump }}
+          FILE: ${{ inputs.file }}
+          PATTERN: ${{ inputs.pattern }}
+          ANCHOR: ${{ inputs.anchor }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+
+          const { BUMP, FILE, PATTERN, ANCHOR, GITHUB_OUTPUT } = process.env;
+          const src = readFileSync(FILE, 'utf8');
+
+          let start = 0;
+          if (ANCHOR) {
+            start = src.indexOf(ANCHOR);
+            if (start === -1) throw new Error(`anchor "${ANCHOR}" not found in ${FILE}`);
+          }
+
+          const re = new RegExp(PATTERN, 'g');
+          const found = [...src.slice(start).matchAll(re)];
+          if (found.length === 0) throw new Error(`pattern did not match in ${FILE}`);
+
+          const versions = new Set(found.map((m) => m[1]));
+          if (versions.size !== 1) {
+            throw new Error(`matches disagree on current version: ${[...versions].join(', ')}`);
+          }
+          const old = found[0][1];
+          const parts = old.split('.').map(Number);
+          if (parts.length !== 3 || parts.some(Number.isNaN)) throw new Error(`not X.Y.Z: ${old}`);
+
+          const [maj, min, pat] = parts;
+          const next =
+            BUMP === 'major' ? `${maj + 1}.0.0` : BUMP === 'minor' ? `${maj}.${min + 1}.0` : `${maj}.${min}.${pat + 1}`;
+
+          // Replace only the captured group so surrounding text is untouched.
+          const head = src.slice(0, start);
+          const tail = src.slice(start).replace(re, (full, v) => full.replace(v, next));
+          writeFileSync(FILE, head + tail);
+
+          appendFileSync(GITHUB_OUTPUT, `old=${old}\nnew=${next}\n`);
+          console.log(`${FILE}: ${old} -> ${next}`);
+          NODE
+
+      - name: Commit and push
+        env:
+          NEW_VERSION: ${{ steps.bump.outputs.new }}
+          OLD_VERSION: ${{ steps.bump.outputs.old }}
+          BRANCH: ${{ inputs.branch }}
+          FILE: ${{ inputs.file }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$FILE"
+          git commit -m "chore(release): bump version to ${NEW_VERSION} [skip ci]" \
+            -m "From ${OLD_VERSION}. Triggered by ${ACTOR} via the version-bump workflow."
+          # Rebase (never merge) in case the branch moved while we were running.
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:${BRANCH}"; then
+              echo "### Version bumped: \`${OLD_VERSION}\` → \`${NEW_VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt); rebasing and retrying"
+            git pull --rebase origin "$BRANCH"
+          done
+          echo "::error::Could not push to ${BRANCH}. If the error is a ruleset violation (GH013), set RELEASE_PUSH_TOKEN to a token that can bypass the ruleset, or add the GitHub Actions app as a bypass actor."
+          exit 1
