@@ -27,3 +27,29 @@ jobs:
 
 Referenced by `@main` (no version pinning yet — revisit if drift/breakage
 becomes a problem).
+
+## Version bump (push straight to main)
+
+`product-version-bump.yml` bumps a semver string in one file and pushes the
+commit directly to the default branch — no PR, no approval. Inputs: `bump`
+(patch/minor/major), `file`, `pattern` (regex with one capture group around
+`X.Y.Z`), optional `anchor`, `branch`, `runner`.
+
+Pushing past a "require pull request" ruleset needs a bypass actor. Either set a
+`RELEASE_PUSH_TOKEN` secret (PAT/App token of a repo admin) in the caller, or add
+the **GitHub Actions** app to the ruleset's bypass list and leave the secret unset
+(the job falls back to `GITHUB_TOKEN`). The commit carries `[skip ci]`.
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      bump: { type: choice, options: [patch, minor, major], default: patch }
+jobs:
+  bump:
+    permissions: { contents: write }
+    uses: EvandroViva/foundation-workflows/.github/workflows/product-version-bump.yml@main
+    with:
+      bump: ${{ inputs.bump }}
+    secrets: inherit
+```
