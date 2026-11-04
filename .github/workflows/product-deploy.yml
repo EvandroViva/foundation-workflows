@@ -273,6 +273,8 @@ jobs:
           # deploys/regressions per release. Only meaningful when ENABLE_DATADOG=true.
           DD_VERSION: ${{ needs.prepare.outputs.image_tag }}
           ZERO_DOWNTIME: ${{ inputs.zero-downtime }}
+          # Commit whose images build-and-push just built (prepare tags images with it).
+          DEPLOY_SHA: ${{ github.sha }}
           EDGE_SERVICES: ${{ inputs.edge-services }}
         run: |
           set -euo pipefail
@@ -298,6 +300,7 @@ jobs:
           export ENABLE_DATADOG="$ENABLE_DATADOG"
           export DD_VERSION="$DD_VERSION"
           export ZERO_DOWNTIME="$ZERO_DOWNTIME"
+          export DEPLOY_SHA="$DEPLOY_SHA"
           export EDGE_SERVICES="$EDGE_SERVICES"
           ENVBLOCK
             # Second block: quoted heredoc, sent verbatim — every $VAR here is meant to
@@ -314,9 +317,15 @@ jobs:
           echo "Image tag:   $IMAGE_TAG"
           echo ""
 
-          # ── Git pull (latest compose files, migrations, env templates) ──
-          echo "--- Pulling latest code ---"
-          git pull origin main
+          # ── Check out the deployed commit (compose files, migrations, env templates) ──
+          # Same commit the images were built from, so config and images always match —
+          # also when deploying a branch (previously the host always pulled main, mixing
+          # branch images with main's compose files). The host ends on a detached HEAD;
+          # works with the shallow (--depth 1) checkouts used on deploy hosts.
+          echo "--- Checking out $DEPLOY_SHA ---"
+          git fetch --depth 1 origin "$DEPLOY_SHA"
+          git checkout --detach FETCH_HEAD
+          git log -1 --format='Deployed commit: %h %s'
 
           # ── Optional backup ──
           if [[ "$DO_BACKUP" == "true" ]]; then
