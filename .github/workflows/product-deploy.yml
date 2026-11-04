@@ -59,6 +59,11 @@ on:
         required: false
         type: boolean
         default: false
+      rollout-settle-seconds:
+        description: 'zero-downtime only: seconds to wait after the new replicas are healthy before draining the old ones, so the proxy has loaded them (Traefik batches Docker events every 2s by default)'
+        required: false
+        type: number
+        default: 5
       edge-services:
         description: 'zero-downtime only: space-separated always-on edge services (e.g. "traefik cloudflared") brought up (created/updated only when their config changed) before the rollout'
         required: false
@@ -276,6 +281,7 @@ jobs:
           # Commit whose images build-and-push just built (prepare tags images with it).
           DEPLOY_SHA: ${{ github.sha }}
           EDGE_SERVICES: ${{ inputs.edge-services }}
+          ROLLOUT_SETTLE_SECONDS: ${{ inputs.rollout-settle-seconds }}
         run: |
           set -euo pipefail
           umask 077
@@ -302,6 +308,7 @@ jobs:
           export ZERO_DOWNTIME="$ZERO_DOWNTIME"
           export DEPLOY_SHA="$DEPLOY_SHA"
           export EDGE_SERVICES="$EDGE_SERVICES"
+          export ROLLOUT_SETTLE_SECONDS="$ROLLOUT_SETTLE_SECONDS"
           ENVBLOCK
             # Second block: quoted heredoc, sent verbatim — every $VAR here is meant to
             # be evaluated on the remote host, not by this local shell.
@@ -421,6 +428,11 @@ jobs:
                 docker rm -f $new >/dev/null
                 return 1
               fi
+              # Docker-healthy isn't proxy-routable yet: Traefik picks the new replicas up
+              # on its next config reload. Draining the old ones first left the service
+              # with no server for ~1s on the sandbox (Traefik answered 503).
+              echo "--- $svc: new replica(s) ready, waiting ${ROLLOUT_SETTLE_SECONDS}s for the proxy ---"
+              sleep "$ROLLOUT_SETTLE_SECONDS"
               echo "--- $svc: draining old replica(s) ---"
               # shellcheck disable=SC2086
               docker stop -t 30 $old >/dev/null
