@@ -59,6 +59,16 @@ on:
         required: false
         type: boolean
         default: false
+      rollback-to-sha:
+        description: >-
+          Fast rollback: redeploy the images already published for this commit
+          (`<environment>-<shortsha>` in GHCR) instead of building. Skips Lint & Test and
+          the build; the host checks out this same commit so compose files match the
+          images. Only works for a commit previously deployed to this environment (else
+          the image pull fails before any container is touched). Full or short SHA.
+        required: false
+        type: string
+        default: ''
       rollout-settle-seconds:
         description: 'zero-downtime only: seconds to wait after the new replicas are healthy before draining the old ones, so the proxy has loaded them (Traefik batches Docker events every 2s by default)'
         required: false
@@ -78,6 +88,8 @@ jobs:
   # ── Lint & Test ───────────────────────────────────────────
   lint-and-test:
     name: Lint & Test
+    # A rollback redeploys images that already passed this when they were built.
+    if: inputs.rollback-to-sha == ''
     runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","ARM64"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
@@ -107,6 +119,7 @@ jobs:
       image_tag: ${{ steps.meta.outputs.image_tag }}
       image_prefix: ${{ steps.meta.outputs.image_prefix }}
       short_sha: ${{ steps.meta.outputs.short_sha }}
+      deploy_sha: ${{ steps.meta.outputs.deploy_sha }}
     steps:
       - name: Build service matrix
         id: matrix
@@ -129,8 +142,18 @@ jobs:
 
       - name: Compute image metadata
         id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ROLLBACK_TO: ${{ inputs.rollback-to-sha }}
         run: |
-          SHORT_SHA="${GITHUB_SHA::7}"
+          DEPLOY_SHA="$GITHUB_SHA"
+          if [[ -n "$ROLLBACK_TO" ]]; then
+            # Resolve a short SHA to the full one (the host fetches by full SHA).
+            DEPLOY_SHA="$(gh api "repos/${{ github.repository }}/commits/${ROLLBACK_TO}" --jq .sha)"
+            echo "Rollback: reusing the images of ${DEPLOY_SHA} (no build)"
+          fi
+          echo "deploy_sha=$DEPLOY_SHA" >> "$GITHUB_OUTPUT"
+          SHORT_SHA="${DEPLOY_SHA::7}"
           IMAGE_TAG="${{ inputs.environment }}-${SHORT_SHA}"
           OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
           IMAGE_PREFIX="ghcr.io/${OWNER}/${{ inputs.image-name }}"
@@ -143,7 +166,7 @@ jobs:
     name: Build ${{ matrix.service }}
     runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","ARM64"]') || 'ubuntu-24.04-arm' }}
     needs: [lint-and-test, prepare]
-    if: needs.prepare.outputs.services != '[]'
+    if: needs.prepare.outputs.services != '[]' && inputs.rollback-to-sha == ''
     environment: ${{ inputs.environment }}
     permissions:
       contents: read
@@ -212,6 +235,11 @@ jobs:
     name: Deploy to EC2
     runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","ARM64"]') || 'ubuntu-latest' }}
     needs: [prepare, build-and-push]
+    # Normally runs after a successful build; a rollback skips the build on purpose.
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' &&
+      (needs.build-and-push.result == 'success' ||
+       (inputs.rollback-to-sha != '' && needs.build-and-push.result == 'skipped'))
     # Binds sandbox/production Environment secrets (EC2_HOST/EC2_USER/EC2_SSH_KEY,
     # TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET) — falls back to repo-level secrets of the
     # same name when an Environment doesn't override them. Production now sets its
@@ -278,8 +306,8 @@ jobs:
           # deploys/regressions per release. Only meaningful when ENABLE_DATADOG=true.
           DD_VERSION: ${{ needs.prepare.outputs.image_tag }}
           ZERO_DOWNTIME: ${{ inputs.zero-downtime }}
-          # Commit whose images build-and-push just built (prepare tags images with it).
-          DEPLOY_SHA: ${{ github.sha }}
+          # Commit whose images are deployed: the one just built, or rollback-to-sha.
+          DEPLOY_SHA: ${{ needs.prepare.outputs.deploy_sha }}
           EDGE_SERVICES: ${{ inputs.edge-services }}
           ROLLOUT_SETTLE_SECONDS: ${{ inputs.rollout-settle-seconds }}
         run: |
@@ -520,6 +548,7 @@ jobs:
           DEPLOY_ADMIN: ${{ inputs.deploy_admin }}
           DEPLOY_WORKERS: ${{ inputs.deploy_workers }}
           BACKUP: ${{ inputs.backup }}
+          ROLLBACK_TO: ${{ inputs.rollback-to-sha }}
           BUILD_RESULT: ${{ needs.build-and-push.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
         with:
@@ -543,6 +572,7 @@ jobs:
             | **Commit** | \`${sha}\` |
             | **Image tag** | \`${tag}\` |
             | **Backup** | ${backup} |
+            | **Rollback** | ${process.env.ROLLBACK_TO ? '⏪ reused published images, no build' : '—'} |
 
             ### Services
 
