@@ -49,6 +49,21 @@ on:
         required: false
         type: string
         default: cloud
+      zero-downtime:
+        description: >-
+          Opt-in zero-downtime rollout. Requires the product's compose files to (1) not pin
+          container_name on api/web/admin/workers, (2) route traffic through a health-aware
+          proxy (e.g. Traefik), (3) define a one-shot `migrate` service (api image, profile
+          `migrate`) and (4) not run migrations on API boot. Migrations must be expand-only:
+          old and new code run side by side against the new schema during the rollout.
+        required: false
+        type: boolean
+        default: false
+      edge-services:
+        description: 'zero-downtime only: space-separated always-on edge services (e.g. "traefik cloudflared") brought up (created/updated only when their config changed) before the rollout'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: deploy-${{ inputs.image-name }}-${{ inputs.environment }}
@@ -257,6 +272,10 @@ jobs:
           # Datadog release tag — the image tag (env-shortsha) so Datadog tracks
           # deploys/regressions per release. Only meaningful when ENABLE_DATADOG=true.
           DD_VERSION: ${{ needs.prepare.outputs.image_tag }}
+          ZERO_DOWNTIME: ${{ inputs.zero-downtime }}
+          # Commit whose images build-and-push just built (prepare tags images with it).
+          DEPLOY_SHA: ${{ github.sha }}
+          EDGE_SERVICES: ${{ inputs.edge-services }}
         run: |
           set -euo pipefail
           umask 077
@@ -280,6 +299,9 @@ jobs:
           export API_CONTAINER_PREFIX="$API_CONTAINER_PREFIX"
           export ENABLE_DATADOG="$ENABLE_DATADOG"
           export DD_VERSION="$DD_VERSION"
+          export ZERO_DOWNTIME="$ZERO_DOWNTIME"
+          export DEPLOY_SHA="$DEPLOY_SHA"
+          export EDGE_SERVICES="$EDGE_SERVICES"
           ENVBLOCK
             # Second block: quoted heredoc, sent verbatim — every $VAR here is meant to
             # be evaluated on the remote host, not by this local shell.
@@ -295,9 +317,15 @@ jobs:
           echo "Image tag:   $IMAGE_TAG"
           echo ""
 
-          # ── Git pull (latest compose files, migrations, env templates) ──
-          echo "--- Pulling latest code ---"
-          git pull origin main
+          # ── Check out the deployed commit (compose files, migrations, env templates) ──
+          # Same commit the images were built from, so config and images always match —
+          # also when deploying a branch (previously the host always pulled main, mixing
+          # branch images with main's compose files). The host ends on a detached HEAD;
+          # works with the shallow (--depth 1) checkouts used on deploy hosts.
+          echo "--- Checking out $DEPLOY_SHA ---"
+          git fetch --depth 1 origin "$DEPLOY_SHA"
+          git checkout --detach FETCH_HEAD
+          git log -1 --format='Deployed commit: %h %s'
 
           # ── Optional backup ──
           if [[ "$DO_BACKUP" == "true" ]]; then
@@ -333,9 +361,96 @@ jobs:
           echo "--- Pulling images ---"
           $DC pull $SERVICES
 
-          # ── Restart containers (--no-deps: don't touch dependency services) ──
-          echo "--- Restarting containers ---"
-          $DC up -d --no-build --no-deps --force-recreate $SERVICES
+          if [[ "$ZERO_DOWNTIME" == "true" ]]; then
+            # ── Zero-downtime path ──
+            # Prints "healthy" / "unhealthy" / "starting" for containers with a
+            # healthcheck, or "running"/"exited"/... (plain state) for ones without.
+            container_status() {
+              docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$1" 2>/dev/null || echo missing
+            }
+
+            # Wait until every given container is healthy (or, without a healthcheck,
+            # has stayed running for 15s). Returns 1 on timeout / crash.
+            wait_ready() {
+              local deadline=$((SECONDS + 180)) id st running_since
+              for id in "$@"; do
+                running_since=""
+                while true; do
+                  st="$(container_status "$id")"
+                  case "$st" in
+                    healthy) break ;;
+                    running)
+                      [[ -z "$running_since" ]] && running_since=$SECONDS
+                      (( SECONDS - running_since >= 15 )) && break ;;
+                    starting) ;;
+                    *) echo "ERROR: container $id is '$st'"; return 1 ;;
+                  esac
+                  if (( SECONDS > deadline )); then
+                    echo "ERROR: container $id not ready in time (last status: $st)"
+                    return 1
+                  fi
+                  sleep 3
+                done
+                echo "Container $id ready ($st)"
+              done
+            }
+
+            # Side-by-side rollout: start the new replicas next to the old ones, wait
+            # for them to be ready (the proxy only routes to healthy containers), then
+            # SIGTERM the old ones so they drain. On failure the new replicas are removed
+            # and the old ones keep serving untouched.
+            rollout() {
+              local svc="$1" old new count
+              old="$($DC ps -q "$svc" | sort)"
+              count="$(printf '%s\n' "$old" | grep -c . || true)"
+              if (( count == 0 )); then
+                echo "--- $svc: no running replica, starting fresh ---"
+                $DC up -d --no-build --no-deps "$svc"
+                # shellcheck disable=SC2046
+                wait_ready $($DC ps -q "$svc")
+                return
+              fi
+              echo "--- $svc: starting $count new replica(s) next to $count old ---"
+              $DC up -d --no-build --no-deps --no-recreate --scale "$svc=$((count * 2))" "$svc"
+              new="$(comm -13 <(printf '%s\n' "$old") <($DC ps -q "$svc" | sort))"
+              # shellcheck disable=SC2086
+              if ! wait_ready $new; then
+                echo "--- $svc: new replica(s) failed, rolling back ---"
+                for id in $new; do docker logs --tail 50 "$id" || true; done
+                # shellcheck disable=SC2086
+                docker rm -f $new >/dev/null
+                return 1
+              fi
+              echo "--- $svc: draining old replica(s) ---"
+              # shellcheck disable=SC2086
+              docker stop -t 30 $old >/dev/null
+              # shellcheck disable=SC2086
+              docker rm $old >/dev/null
+              echo "--- $svc: rollout complete ---"
+            }
+
+            if [[ -n "$EDGE_SERVICES" ]]; then
+              echo "--- Ensuring edge services are up: $EDGE_SERVICES ---"
+              # shellcheck disable=SC2086
+              $DC up -d --no-build --no-deps $EDGE_SERVICES
+            fi
+
+            # Migrations run once, before any new code starts, from the API image of
+            # this release. Expand-only migrations keep the still-running old release
+            # working; a failure aborts the deploy with the old release untouched.
+            if [[ "$DEPLOY_API" == "true" ]]; then
+              echo "--- Running database migrations ---"
+              $DC --profile migrate run --rm --no-deps migrate
+            fi
+
+            for svc in $SERVICES; do
+              rollout "$svc"
+            done
+          else
+            # ── Restart containers (--no-deps: don't touch dependency services) ──
+            echo "--- Restarting containers ---"
+            $DC up -d --no-build --no-deps --force-recreate $SERVICES
+          fi
 
           # ── Ensure the Datadog agent is running (production only; repos without a Datadog
           # profile in their compose files leave ENABLE_DATADOG unset) ──
@@ -345,7 +460,8 @@ jobs:
           fi
 
           # ── Health check (if API was deployed) ──
-          if [[ "$DEPLOY_API" == "true" ]]; then
+          # (zero-downtime: rollout() already waited for every new replica to be healthy)
+          if [[ "$DEPLOY_API" == "true" && "$ZERO_DOWNTIME" != "true" ]]; then
             echo "--- Waiting for API health check ---"
             HEALTHY=false
             for i in $(seq 1 10); do
