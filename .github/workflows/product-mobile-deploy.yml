@@ -167,6 +167,25 @@ jobs:
         working-directory: apps/mobile
         run: npx dotenv-cli -e ${{ env.ENV_FILE }} -- npx expo prebuild --platform android --no-install
 
+      # GitHub-hosted runners (4 vCPU / 16 GB RAM, small swap) get OOM-killed while
+      # Gradle compiles React Native's C++ (CMake/ninja spawns a clang per core for
+      # each native module and ABI) — the job dies with "The runner has received a
+      # shutdown signal". Free unused toolchains, add swap on the temp disk and log
+      # the starting point. Self-hosted runners are left untouched.
+      - name: Prepare GitHub-hosted runner for the native build
+        if: inputs.runner != 'self-hosted'
+        run: |
+          echo "::group::Before"; df -h / /mnt 2>/dev/null; free -m; nproc; echo "::endgroup::"
+          # Unused toolchains in the hosted image; the Android SDK/NDK is kept.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          SWAP_DIR=/mnt; sudo test -w /mnt || SWAP_DIR=/
+          sudo swapoff -a || true
+          sudo fallocate -l 10G "$SWAP_DIR/ci-swapfile"
+          sudo chmod 600 "$SWAP_DIR/ci-swapfile"
+          sudo mkswap "$SWAP_DIR/ci-swapfile" >/dev/null
+          sudo swapon "$SWAP_DIR/ci-swapfile"
+          echo "::group::After"; df -h / /mnt 2>/dev/null; free -m; swapon --show; echo "::endgroup::"
+
       - uses: gradle/actions/setup-gradle@v4
 
       - name: Decode keystore
@@ -222,10 +241,19 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          # Hosted runners only: cap Gradle's parallel tasks (each native one runs its own
+          # ninja/clang pool) so the C++ build fits in RAM.
+          GRADLE_EXTRA_ARGS: ${{ inputs.runner != 'self-hosted' && '--max-workers=2' || '' }}
         # reactNativeArchitectures restricted to real-device ABIs (x86/x86_64 are emulator-only
         # and roughly double native build time for no production benefit); --build-cache reuses
         # unchanged task outputs across CI runs via the gradle-home cache already restored above.
-        run: npx dotenv-cli -e ${{ env.ENV_FILE }} -- bash -c 'cd android && ./gradlew bundleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a --build-cache'
+        run: |
+          # Stream RAM/swap/disk into this step's log every 60s: the log survives even if
+          # the VM is killed mid-build, so an OOM/disk-full death is visible afterwards.
+          (while sleep 60; do
+            echo "[resources] $(free -m | awk '/Mem:/{printf "mem %s/%s MB", $3, $2} /Swap:/{printf " | swap %s MB", $3}') | disk free $(df -h / | awk 'NR==2{print $4}')"
+          done) &
+          npx dotenv-cli -e ${{ env.ENV_FILE }} -- bash -c 'cd android && ./gradlew bundleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a --build-cache $GRADLE_EXTRA_ARGS'
 
       - name: Upload AAB
         uses: actions/upload-artifact@v4
