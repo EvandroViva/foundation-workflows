@@ -74,6 +74,20 @@ on:
         required: false
         type: number
         default: 5
+      warmup-paths:
+        description: >-
+          Space-separated web paths (e.g. "/pt /pt/guias") requested on every new web
+          replica before it takes traffic, so the first real visitors don't pay Next.js's
+          lazy route loading after a deploy. Requested from inside the container on its
+          own port; best-effort (a failing path never fails the deploy). Empty = off.
+        required: false
+        type: string
+        default: ''
+      warmup-port:
+        description: 'Port the web container listens on, used by warmup-paths'
+        required: false
+        type: number
+        default: 3000
       edge-services:
         description: 'zero-downtime only: space-separated always-on edge services (e.g. "traefik cloudflared") brought up (created/updated only when their config changed) before the rollout'
         required: false
@@ -310,6 +324,8 @@ jobs:
           DEPLOY_SHA: ${{ needs.prepare.outputs.deploy_sha }}
           EDGE_SERVICES: ${{ inputs.edge-services }}
           ROLLOUT_SETTLE_SECONDS: ${{ inputs.rollout-settle-seconds }}
+          WARMUP_PATHS: ${{ inputs.warmup-paths }}
+          WARMUP_PORT: ${{ inputs.warmup-port }}
         run: |
           set -euo pipefail
           umask 077
@@ -337,6 +353,8 @@ jobs:
           export DEPLOY_SHA="$DEPLOY_SHA"
           export EDGE_SERVICES="$EDGE_SERVICES"
           export ROLLOUT_SETTLE_SECONDS="$ROLLOUT_SETTLE_SECONDS"
+          export WARMUP_PATHS="$WARMUP_PATHS"
+          export WARMUP_PORT="$WARMUP_PORT"
           ENVBLOCK
             # Second block: quoted heredoc, sent verbatim — every $VAR here is meant to
             # be evaluated on the remote host, not by this local shell.
@@ -396,6 +414,22 @@ jobs:
           echo "--- Pulling images ---"
           $DC pull $SERVICES
 
+          # Requests WARMUP_PATHS on each given web container from inside it, so Next.js
+          # loads those routes before real traffic arrives. Best-effort: never fails.
+          warm_up() {
+            [[ -z "${WARMUP_PATHS:-}" ]] && return 0
+            local id path code
+            for id in "$@"; do
+              echo "--- Warming up $id ---"
+              for path in $WARMUP_PATHS; do
+                code="$(docker exec "$id" wget -q -T 30 -O /dev/null -S "http://127.0.0.1:${WARMUP_PORT}${path}" 2>&1 \
+                  | awk '/^ *HTTP\//{c=$2} END{print c}')" || true
+                echo "  ${path} -> ${code:-failed}"
+              done
+            done
+            return 0
+          }
+
           if [[ "$ZERO_DOWNTIME" == "true" ]]; then
             # ── Zero-downtime path ──
             # Prints "healthy" / "unhealthy" / "starting" for containers with a
@@ -443,6 +477,8 @@ jobs:
                 $DC up -d --no-build --no-deps "$svc"
                 # shellcheck disable=SC2046
                 wait_ready $($DC ps -q "$svc")
+                # shellcheck disable=SC2046
+                [[ "$svc" == "web" ]] && warm_up $($DC ps -q "$svc")
                 return
               fi
               echo "--- $svc: starting $count new replica(s) next to $count old ---"
@@ -456,6 +492,10 @@ jobs:
                 docker rm -f $new >/dev/null
                 return 1
               fi
+              # Warm the new web replicas before the old ones drain (they're already
+              # routable once healthy, so this also shortens the cold window for visitors).
+              # shellcheck disable=SC2086
+              [[ "$svc" == "web" ]] && warm_up $new
               # Docker-healthy isn't proxy-routable yet: Traefik picks the new replicas up
               # on its next config reload. Draining the old ones first left the service
               # with no server for ~1s on the sandbox (Traefik answered 503).
@@ -490,6 +530,11 @@ jobs:
             # ── Restart containers (--no-deps: don't touch dependency services) ──
             echo "--- Restarting containers ---"
             $DC up -d --no-build --no-deps --force-recreate $SERVICES
+            if [[ " $SERVICES " == *" web "* && -n "${WARMUP_PATHS:-}" ]]; then
+              sleep 5
+              # shellcheck disable=SC2046
+              warm_up $($DC ps -q web)
+            fi
           fi
 
           # ── Ensure the Datadog agent is running (production only; repos without a Datadog
