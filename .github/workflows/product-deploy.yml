@@ -177,8 +177,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Self-hosted (Raspberry Pi): build on the host daemon's own BuildKit (`docker` driver,
+      # the runner containers mount /var/run/docker.sock). Its build cache persists in the
+      # daemon across jobs, runners and products, so there is no per-job cache import/export —
+      # the old type=local export took 5–17 min per service on the Pi and left orphaned blobs
+      # behind (52GB for gifto). The host uses the containerd image store, so the docker driver
+      # can push and attach attestations. Cloud runners keep a fresh docker-container builder.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver: ${{ inputs.runner == 'self-hosted' && 'docker' || 'docker-container' }}
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -222,53 +230,27 @@ jobs:
           secret-files: |
             web_env=/tmp/web.env
             admin_env=/tmp/admin.env
-          # Self-hosted ARM64 runners use a host-mounted local cache dir (see docker-runner's
-          # docker-compose-raspberry.yml) instead of the gha backend: it's shared across all
-          # self-hosted containers for this product regardless of which one lands the job, has
-          # no 10GB/eviction limit, and doesn't race with the other concurrent matrix builds
-          # over the network the way type=gha did (caused "blob sha256:...: not found" errors).
-          cache-from: ${{ inputs.runner == 'self-hosted' && format('type=local,src=/buildx-cache/{0}-{1}', matrix.service, inputs.environment) || format('type=gha,scope={0}-{1}', matrix.service, inputs.environment) }}
-          cache-to: ${{ inputs.runner == 'self-hosted' && format('type=local,dest=/buildx-cache/{0}-{1},mode=max', matrix.service, inputs.environment) || format('type=gha,mode=max,scope={0}-{1}', matrix.service, inputs.environment) }}
+          # Cloud runners only: GitHub Actions cache. Self-hosted builds rely on the host
+          # daemon's persistent build cache instead (see "Set up Docker Buildx").
+          cache-from: ${{ inputs.runner != 'self-hosted' && format('type=gha,scope={0}-{1}', matrix.service, inputs.environment) || '' }}
+          cache-to: ${{ inputs.runner != 'self-hosted' && format('type=gha,mode=max,scope={0}-{1}', matrix.service, inputs.environment) || '' }}
 
-      # The local exporter rewrites index.json but never deletes blobs it stops referencing, so
-      # the dir grew forever (gifto api-sandbox hit 24.7GB, 93% orphaned). Keep exporting in
-      # place (no second copy on disk mid-build, old cache intact if the build fails) and
-      # garbage-collect here instead: walk index.json → manifests →
-      # layers/config and delete every blob not reached. Only after a successful build, and
-      # safe without locking: matrix jobs use distinct dirs and the workflow-level concurrency
-      # group serializes runs per product+environment.
-      - name: Prune orphaned build cache blobs
-        if: inputs.runner == 'self-hosted'
+      # The host daemon's build cache is shared by every product's builds on the Pi; cap it
+      # here (BuildKit evicts least-recently-used records first, never ones in use by a
+      # running build). Also drop production images from the host: only sandbox runs there,
+      # production pulls on its own host. Runs even when the build failed.
+      - name: Trim host build cache
+        if: always() && inputs.runner == 'self-hosted'
         env:
-          CACHE_DIR: /buildx-cache/${{ matrix.service }}-${{ inputs.environment }}
+          IMAGE: ${{ needs.prepare.outputs.image_prefix }}/${{ matrix.service }}
+          IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+          ENVIRONMENT: ${{ inputs.environment }}
         run: |
-          rm -rf "${CACHE_DIR}-new"   # leftover from the rejected swap approach
-          BLOBS="$CACHE_DIR/blobs/sha256"
-          if [[ ! -f "$CACHE_DIR/index.json" || ! -d "$BLOBS" ]]; then
-            echo "No local cache at $CACHE_DIR; nothing to prune"; exit 0
+          if [[ "$ENVIRONMENT" != "sandbox" ]]; then
+            docker image rm "$IMAGE:$IMAGE_TAG" "$IMAGE:$ENVIRONMENT-latest" 2>/dev/null || true
           fi
-          declare -A keep
-          mapfile -t queue < <(jq -r '.manifests[]?.digest' "$CACHE_DIR/index.json")
-          while ((${#queue[@]})); do
-            digest="${queue[0]}"; queue=("${queue[@]:1}")
-            hash="${digest#sha256:}"
-            [[ -n "${keep[$hash]:-}" ]] && continue
-            keep[$hash]=1
-            blob="$BLOBS/$hash"
-            # Manifests/indexes/configs are small JSON; layers are big binaries — skip those.
-            if [[ -f "$blob" && $(stat -c%s "$blob") -lt 10485760 ]] && jq -e 'type == "object"' "$blob" >/dev/null 2>&1; then
-              mapfile -t -O "${#queue[@]}" queue < <(jq -r '(.manifests // [])[].digest, (.layers // [])[].digest, (.config.digest // empty)' "$blob")
-            fi
-          done
-          # Guard: an unparsable index must never wipe the cache.
-          if (( ${#keep[@]} < 2 )); then
-            echo "::warning::Only ${#keep[@]} referenced blob(s) found in $CACHE_DIR; skipping prune"; exit 0
-          fi
-          before=$(du -sh "$CACHE_DIR" | cut -f1); removed=0
-          for blob in "$BLOBS"/*; do
-            [[ -n "${keep[$(basename "$blob")]:-}" ]] || { rm -f "$blob"; removed=$((removed + 1)); }
-          done
-          echo "Kept ${#keep[@]} blobs, removed $removed; $before → $(du -sh "$CACHE_DIR" | cut -f1)"
+          docker builder prune --force --max-used-space 20GB | tail -1
+          docker system df --format '{{.Type}}: {{.Size}} (reclaimable {{.Reclaimable}})' | grep -E '^(Images|Build Cache)'
 
   # ── Deploy to EC2 ─────────────────────────────────────────
   deploy:
