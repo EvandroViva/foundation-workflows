@@ -241,6 +241,8 @@ jobs:
       # production pulls on its own host. Runs even when the build failed.
       - name: Trim host build cache
         if: always() && inputs.runner == 'self-hosted'
+        # Housekeeping only: never fail the build (a failed matrix job cancels its siblings).
+        continue-on-error: true
         env:
           IMAGE: ${{ needs.prepare.outputs.image_prefix }}/${{ matrix.service }}
           IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
@@ -250,7 +252,8 @@ jobs:
             docker image rm "$IMAGE:$IMAGE_TAG" "$IMAGE:$ENVIRONMENT-latest" 2>/dev/null || true
           fi
           docker builder prune --force --max-used-space 20GB | tail -1
-          docker system df --format '{{.Type}}: {{.Size}} (reclaimable {{.Reclaimable}})' | grep -E '^(Images|Build Cache)'
+          # Informational. `docker system df` errors while another build is mid-snapshot.
+          docker buildx du 2>/dev/null | tail -2 || true
 
   # ── Deploy to EC2 ─────────────────────────────────────────
   deploy:
