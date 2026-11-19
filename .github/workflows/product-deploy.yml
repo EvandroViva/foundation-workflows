@@ -69,6 +69,14 @@ on:
         required: false
         type: string
         default: ''
+      skip-lint-test:
+        description: >-
+          Skip the Lint & Test job and build straight away. For redeploys of a commit whose
+          CI already passed (e.g. a PR branch to sandbox). The build still fails on type or
+          compile errors; only lint rules and unit tests are skipped.
+        required: false
+        type: boolean
+        default: false
       rollout-settle-seconds:
         description: 'zero-downtime only: seconds to wait after the new replicas are healthy before draining the old ones, so the proxy has loaded them (Traefik batches Docker events every 2s by default)'
         required: false
@@ -89,7 +97,7 @@ jobs:
   lint-and-test:
     name: Lint & Test
     # A rollback redeploys images that already passed this when they were built.
-    if: inputs.rollback-to-sha == ''
+    if: inputs.rollback-to-sha == '' && !inputs.skip-lint-test
     runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","ARM64"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
@@ -166,7 +174,12 @@ jobs:
     name: Build ${{ matrix.service }}
     runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","ARM64"]') || 'ubuntu-24.04-arm' }}
     needs: [lint-and-test, prepare]
-    if: needs.prepare.outputs.services != '[]' && inputs.rollback-to-sha == ''
+    # A skipped needs-job would skip this one too unless the condition uses a status check.
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' &&
+      (needs.lint-and-test.result == 'success' ||
+       (inputs.skip-lint-test && needs.lint-and-test.result == 'skipped')) &&
+      needs.prepare.outputs.services != '[]' && inputs.rollback-to-sha == ''
     environment: ${{ inputs.environment }}
     permissions:
       contents: read
@@ -549,6 +562,7 @@ jobs:
           DEPLOY_WORKERS: ${{ inputs.deploy_workers }}
           BACKUP: ${{ inputs.backup }}
           ROLLBACK_TO: ${{ inputs.rollback-to-sha }}
+          SKIP_LINT_TEST: ${{ inputs.skip-lint-test }}
           BUILD_RESULT: ${{ needs.build-and-push.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
         with:
@@ -573,6 +587,7 @@ jobs:
             | **Image tag** | \`${tag}\` |
             | **Backup** | ${backup} |
             | **Rollback** | ${process.env.ROLLBACK_TO ? '⏪ reused published images, no build' : '—'} |
+            | **Lint & Test** | ${process.env.SKIP_LINT_TEST === 'true' ? '⏭️ skipped on request' : '—'} |
 
             ### Services
 
