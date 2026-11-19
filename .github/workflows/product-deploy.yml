@@ -231,10 +231,9 @@ jobs:
           cache-to: ${{ inputs.runner == 'self-hosted' && format('type=local,dest=/buildx-cache/{0}-{1},mode=max', matrix.service, inputs.environment) || format('type=gha,mode=max,scope={0}-{1}', matrix.service, inputs.environment) }}
 
       # The local exporter rewrites index.json but never deletes blobs it stops referencing, so
-      # the dir grew forever (gifto api-sandbox hit 24.7GB, 93% orphaned). Exporting to a fresh
-      # dir and swapping instead was tried and rejected: it re-streams the whole cache every
-      # build (~17 min for 1.7GB on the Pi vs ~4 min in place, where existing blobs are skipped).
-      # So keep exporting in place and garbage-collect here: walk index.json → manifests →
+      # the dir grew forever (gifto api-sandbox hit 24.7GB, 93% orphaned). Keep exporting in
+      # place (no second copy on disk mid-build, old cache intact if the build fails) and
+      # garbage-collect here instead: walk index.json → manifests →
       # layers/config and delete every blob not reached. Only after a successful build, and
       # safe without locking: matrix jobs use distinct dirs and the workflow-level concurrency
       # group serializes runs per product+environment.
