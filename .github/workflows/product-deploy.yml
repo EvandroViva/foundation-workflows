@@ -201,6 +201,12 @@ jobs:
           WEB_ENV: ${{ secrets.WEB_ENV }}
           ADMIN_ENV: ${{ secrets.ADMIN_ENV }}
 
+      # A failed/cancelled previous run can leave a partial "-new" export behind; the local
+      # exporter would add to it instead of starting fresh, so clear it first.
+      - name: Clear stale cache export
+        if: inputs.runner == 'self-hosted'
+        run: rm -rf "/buildx-cache/${{ matrix.service }}-${{ inputs.environment }}-new"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -227,8 +233,28 @@ jobs:
           # self-hosted containers for this product regardless of which one lands the job, has
           # no 10GB/eviction limit, and doesn't race with the other concurrent matrix builds
           # over the network the way type=gha did (caused "blob sha256:...: not found" errors).
+          # The local exporter never deletes blobs the new index.json stops referencing, so
+          # exporting in place grows forever (gifto api-sandbox hit 24.7GB, 93% orphaned). Export
+          # to a fresh "-new" dir instead and swap it in below, so the cache stays one build's size.
           cache-from: ${{ inputs.runner == 'self-hosted' && format('type=local,src=/buildx-cache/{0}-{1}', matrix.service, inputs.environment) || format('type=gha,scope={0}-{1}', matrix.service, inputs.environment) }}
-          cache-to: ${{ inputs.runner == 'self-hosted' && format('type=local,dest=/buildx-cache/{0}-{1},mode=max', matrix.service, inputs.environment) || format('type=gha,mode=max,scope={0}-{1}', matrix.service, inputs.environment) }}
+          cache-to: ${{ inputs.runner == 'self-hosted' && format('type=local,dest=/buildx-cache/{0}-{1}-new,mode=max', matrix.service, inputs.environment) || format('type=gha,mode=max,scope={0}-{1}', matrix.service, inputs.environment) }}
+
+      # Swap the freshly exported cache in place of the old one (drops orphaned blobs). Only
+      # after a successful build: on failure the old cache stays and the next run starts clean.
+      # Safe without locking: matrix jobs use distinct dirs and the workflow-level concurrency
+      # group serializes runs per product+environment.
+      - name: Rotate local build cache
+        if: inputs.runner == 'self-hosted'
+        env:
+          CACHE_DIR: /buildx-cache/${{ matrix.service }}-${{ inputs.environment }}
+        run: |
+          if [[ -f "${CACHE_DIR}-new/index.json" ]]; then
+            rm -rf "$CACHE_DIR"
+            mv "${CACHE_DIR}-new" "$CACHE_DIR"
+            du -sh "$CACHE_DIR"
+          else
+            echo "No new cache exported; keeping $CACHE_DIR"
+          fi
 
   # ── Deploy to EC2 ─────────────────────────────────────────
   deploy:
