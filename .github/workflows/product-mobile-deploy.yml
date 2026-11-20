@@ -65,6 +65,14 @@ on:
         required: false
         type: string
         default: cloud
+      skip-lint-test:
+        description: >-
+          Skip Lint & Test (~7 min) for a commit whose CI already passed. Honored for the
+          sandbox environment only: production store releases always run it, and a skip
+          request there is ignored (and reported in the summary).
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: mobile-deploy-${{ inputs.android-package-production }}-${{ inputs.environment }}
@@ -74,6 +82,7 @@ jobs:
   # ── Lint & Test ───────────────────────────────────────────
   lint-and-test:
     name: Lint & Test
+    if: ${{ !(inputs.skip-lint-test && inputs.environment == 'sandbox') }}
     runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     permissions:
       contents: read
@@ -101,7 +110,11 @@ jobs:
     name: Build Android
     runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     needs: lint-and-test
-    if: inputs.deploy_android == true
+    # A skipped needs-job would skip this one too unless the condition uses a status check.
+    if: >-
+      !cancelled() && inputs.deploy_android == true &&
+      (needs.lint-and-test.result == 'success' ||
+       (inputs.skip-lint-test && inputs.environment == 'sandbox' && needs.lint-and-test.result == 'skipped'))
     environment: ${{ inputs.environment }}
     permissions:
       contents: read
@@ -293,7 +306,10 @@ jobs:
     name: Deploy iOS
     runs-on: ${{ inputs.runner == 'self-hosted' && fromJson('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     needs: lint-and-test
-    if: inputs.deploy_ios == true
+    if: >-
+      !cancelled() && inputs.deploy_ios == true &&
+      (needs.lint-and-test.result == 'success' ||
+       (inputs.skip-lint-test && inputs.environment == 'sandbox' && needs.lint-and-test.result == 'skipped'))
     permissions:
       contents: write
     steps:
@@ -336,6 +352,7 @@ jobs:
           VERSION_CODE: ${{ inputs.version_code }}
           ANDROID_BUILD_RESULT: ${{ needs.deploy-play-store.result }}
           IOS_RESULT: ${{ needs.deploy-ios.result }}
+          SKIP_LINT_TEST: ${{ inputs.skip-lint-test }}
         with:
           script: |
             const env = process.env.DEPLOY_ENV;
@@ -348,6 +365,9 @@ jobs:
             const androidResult = process.env.ANDROID_BUILD_RESULT;
             const iosResult = process.env.IOS_RESULT;
             const iosBranch = env === 'production' ? 'deploy' : 'deploy-sandbox';
+            const lintTest = process.env.SKIP_LINT_TEST !== 'true' ? '—'
+              : env === 'sandbox' ? '⏭️ skipped on request'
+              : '⚠️ skip requested but ignored (sandbox only)';
 
             const icon = (v) => v === 'true' ? '✅' : '⬜';
             const statusIcon = (r) => r === 'success' ? '✅' : r === 'skipped' ? '⏭️' : '❌';
@@ -358,6 +378,7 @@ jobs:
             |---|---|
             | **Environment** | \`${env}\` |
             | **Commit** | \`${sha}\` |
+            | **Lint & Test** | ${lintTest} |
 
             ### Platforms
 
